@@ -9,7 +9,7 @@ from agent_db import ensure_ready
 from tools.inventory_tools import get_inventory, check_safety_stock
 from tools.analytics_tools import get_kpi, get_anomalies
 from sqlmodel import Session, select
-from database import get_session, create_db
+from database import get_session, create_db, engine
 from models import Warehouse, Item, ClaimEvent, EventLog
 from datetime import datetime
 from groq import Groq
