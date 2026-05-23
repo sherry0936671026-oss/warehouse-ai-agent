@@ -1,48 +1,72 @@
-from agent_db import get_conn
+import db
+
+
+def _available_qty(warehouse_id: str, sku: str, conn) -> int:
+    row = conn.execute("""
+        SELECT SUM(i.quantity) AS qty
+          FROM inventory i
+          JOIN storage_locations sl ON i.location_id = sl.location_id
+         WHERE sl.warehouse_id=? AND i.sku=?
+           AND sl.zone_type IN ('PICKING','BUFFER')
+           AND i.acct_status='AVAILABLE'
+    """, (warehouse_id, sku)).fetchone()
+    return row["qty"] or 0
 
 
 def get_inventory(sku: str, warehouse_id: str = None) -> dict:
-    conn = get_conn()
-    c = conn.cursor()
-    if warehouse_id:
-        row = c.execute(
-            """SELECT i.warehouse_id, w.name as warehouse_name, i.sku, i.product_name,
-                      i.quantity, i.safety_stock, i.unit
-               FROM inventory i JOIN warehouses w ON i.warehouse_id = w.id
-               WHERE i.sku=? AND i.warehouse_id=?""",
-            (sku, warehouse_id)
-        ).fetchone()
+    conn = db.get_conn()
+    if not conn.execute("SELECT 1 FROM products WHERE sku=?", (sku,)).fetchone():
         conn.close()
-        if not row:
-            return {"error": f"找不到 {sku} 在 {warehouse_id} 的庫存"}
-        d = dict(row)
-        d["status"] = "低庫存" if d["quantity"] < d["safety_stock"] else "正常"
-        d["shortage"] = max(0, d["safety_stock"] - d["quantity"])
-        return d
-
-    rows = c.execute(
-        """SELECT i.warehouse_id, w.name as warehouse_name, i.sku, i.product_name,
-                  i.quantity, i.safety_stock, i.unit
-           FROM inventory i JOIN warehouses w ON i.warehouse_id = w.id
-           WHERE i.sku=? ORDER BY i.quantity DESC""",
-        (sku,)
-    ).fetchall()
-    conn.close()
-    if not rows:
         return {"error": f"找不到 SKU {sku}"}
-    warehouses, total = [], 0
-    for r in rows:
-        d = dict(r)
-        d["status"] = "低庫存" if d["quantity"] < d["safety_stock"] else "正常"
-        d["shortage"] = max(0, d["safety_stock"] - d["quantity"])
-        warehouses.append(d)
-        total += d["quantity"]
+
+    product = conn.execute("SELECT * FROM products WHERE sku=?", (sku,)).fetchone()
+
+    if warehouse_id:
+        wh = conn.execute("SELECT * FROM warehouses WHERE id=?", (warehouse_id,)).fetchone()
+        if not wh:
+            conn.close()
+            return {"error": f"找不到倉庫 {warehouse_id}"}
+        qty = _available_qty(warehouse_id, sku, conn)
+        conn.close()
+        shortage = max(0, product["safety_stock"] - qty)
+        return {
+            "warehouse_id": warehouse_id,
+            "warehouse_name": wh["name"],
+            "sku": sku,
+            "product_name": product["name"],
+            "unit": product["unit"],
+            "quantity": qty,
+            "safety_stock": product["safety_stock"],
+            "status": "低庫存" if qty < product["safety_stock"] else "正常",
+            "shortage": shortage,
+        }
+
+    warehouses = conn.execute("SELECT id, name FROM warehouses ORDER BY id").fetchall()
+    result = []
+    total = 0
+    for wh in warehouses:
+        qty = _available_qty(wh["id"], sku, conn)
+        shortage = max(0, product["safety_stock"] - qty)
+        result.append({
+            "warehouse_id": wh["id"],
+            "warehouse_name": wh["name"],
+            "sku": sku,
+            "product_name": product["name"],
+            "unit": product["unit"],
+            "quantity": qty,
+            "safety_stock": product["safety_stock"],
+            "status": "低庫存" if qty < product["safety_stock"] else "正常",
+            "shortage": shortage,
+        })
+        total += qty
+    conn.close()
     return {
         "sku": sku,
-        "product_name": rows[0]["product_name"],
-        "unit": rows[0]["unit"],
+        "product_name": product["name"],
+        "unit": product["unit"],
         "total_quantity": total,
-        "warehouses": warehouses,
+        "safety_stock": product["safety_stock"],
+        "warehouses": result,
     }
 
 
@@ -68,18 +92,25 @@ def compare_inventory(sku: str) -> dict:
 
 
 def check_safety_stock(warehouse_id: str = None) -> list:
-    conn = get_conn()
+    conn = db.get_conn()
     sql = """
-        SELECT i.warehouse_id, w.name as warehouse_name, i.sku, i.product_name,
-               i.quantity, i.safety_stock, i.unit,
-               (i.safety_stock - i.quantity) AS shortage
-        FROM inventory i JOIN warehouses w ON i.warehouse_id = w.id
-        WHERE i.quantity < i.safety_stock
+        SELECT sl.warehouse_id, w.name AS warehouse_name,
+               i.sku, p.name AS product_name, p.unit,
+               SUM(i.quantity) AS quantity, p.safety_stock,
+               p.safety_stock - SUM(i.quantity) AS shortage
+          FROM inventory i
+          JOIN storage_locations sl ON i.location_id = sl.location_id
+          JOIN warehouses w ON sl.warehouse_id = w.id
+          JOIN products p ON i.sku = p.sku
+         WHERE sl.zone_type IN ('PICKING','BUFFER')
+           AND i.acct_status = 'AVAILABLE'
+         GROUP BY sl.warehouse_id, i.sku
+        HAVING SUM(i.quantity) < p.safety_stock
     """
-    params = ()
+    params = []
     if warehouse_id:
-        sql += " AND i.warehouse_id=?"
-        params = (warehouse_id,)
+        sql += " AND sl.warehouse_id=?"
+        params.append(warehouse_id)
     sql += " ORDER BY shortage DESC"
     rows = conn.execute(sql, params).fetchall()
     conn.close()
