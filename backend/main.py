@@ -22,7 +22,8 @@ class UTF8JSONResponse(JSONResponse):
 
 app = FastAPI(default_response_class=UTF8JSONResponse)
 import os
-groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+_groq_key = os.environ.get("GROQ_API_KEY")
+groq_client = Groq(api_key=_groq_key) if _groq_key else None
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +35,12 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     create_db()
-    ensure_ready()  # 初始化 AI agent 資料庫
+    ensure_ready()
+    # 若 Claim 資料表是空的（例如 Railway 首次啟動），自動 seed 示範資料
+    from seed import seed
+    with Session(engine) as s:
+        if not s.exec(select(Warehouse)).first():
+            seed()
 
 
 class AgentChatRequest(BaseModel):
@@ -144,12 +150,13 @@ PRB 代碼：{claim.prb_code}（1-2=進貨短少，1-5=其他異常，1-7=移除
 【摘要】2-3句話說明這筆異常
 【建議行動】條列式，最多3點"""
 
+    if not groq_client:
+        return {"summary": "（Groq API 未設定，AI 摘要暫時不可用）"}
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=300,
     )
-    
     return {"summary": response.choices[0].message.content}
 # 檢查重複 Claim
 @app.get("/claims/check-duplicate")
