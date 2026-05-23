@@ -54,8 +54,14 @@ def _new_mvt_id() -> str:
     """微秒級唯一 ID，避免同秒衝突。"""
     return f"MVT-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-def _new_claim_id() -> str:
-    return _new_id("CLM", "claims", "claim_id")
+def _new_claim_id(conn) -> str:
+    """同一個 conn 內計數，避免同 transaction 中序號衝突。"""
+    d = datetime.now().strftime("%Y%m%d")
+    n = conn.execute(
+        "SELECT COUNT(*) FROM claims WHERE claim_id LIKE ?",
+        (f"CLM-{d}-%",)
+    ).fetchone()[0]
+    return f"CLM-{d}-{n+1:03d}"
 
 
 # ── Inventory Helpers ─────────────────────────────────────────────────────────
@@ -146,7 +152,7 @@ def _auto_shortage_claim(conn, order_id: str, from_wh: str, to_wh: str,
     physical_wh = 收貨倉（東西理論上應在這裡）
     account_wh  = 發貨倉（負責補足差異）
     """
-    claim_id = _new_claim_id()
+    claim_id = _new_claim_id(conn)
     now = datetime.now().isoformat()
     conn.execute("""
         INSERT INTO claims
