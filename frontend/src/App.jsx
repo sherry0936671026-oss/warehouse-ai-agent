@@ -265,7 +265,7 @@ export default function App() {
     if (!msg || chatLoading) return
     setChatMessages(m => [...m, { role: "user", text: msg }])
     setChatInput(""); setChatLoading(true)
-    axios.post(`${API}/agent/chat`, { message: msg })
+    axios.post(`${API}/agent/chat`, { message: msg }, { timeout: 90000 })
       .then(r => {
         setChatMessages(m => [...m, {
           role: "ai", text: r.data.reply,
@@ -273,7 +273,13 @@ export default function App() {
           decisionLog: r.data.decision_log,
         }])
       })
-      .catch(() => setChatMessages(m => [...m, { role: "ai", text: "連線失敗，請確認後端是否啟動。", categories: [], decisionLog: [] }]))
+      .catch(err => {
+        const isTimeout = err.code === "ECONNABORTED" || err.message?.includes("timeout")
+        const text = isTimeout
+          ? "回應逾時（AI 分析需要 20–40 秒，請再試一次）"
+          : `連線失敗（${err.response?.status || err.message || "網路錯誤"}），請確認後端是否啟動。`
+        setChatMessages(m => [...m, { role: "ai", text, categories: [], decisionLog: [] }])
+      })
       .finally(() => setChatLoading(false))
   }
 
@@ -282,7 +288,7 @@ export default function App() {
     setTransferLoading(true); setTransferResult(null)
     const whLabel = WH_LIST.find(w => w.value === transferTarget)?.label || transferTarget
     const skuLabel = SKU_LIST.find(s => s.value === transferSku)?.label || transferSku
-    axios.post(`${API}/agent/chat`, { message: `${skuLabel} 需要補貨到 ${whLabel}，請建議調撥方案` })
+    axios.post(`${API}/agent/chat`, { message: `${skuLabel} 需要補貨到 ${whLabel}，請建議調撥方案` }, { timeout: 90000 })
       .then(r => setTransferResult(r.data))
       .finally(() => setTransferLoading(false))
   }
@@ -744,7 +750,7 @@ export default function App() {
                 {chatLoading && (
                   <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#888", fontSize: 13 }}>
                     <div style={{ width: 28, height: 28, borderRadius: "50%", background: "#378ADD", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, color: "#fff" }}>AI</div>
-                    <div style={{ background: "#fff", border: "0.5px solid #e8e6e0", borderRadius: "16px 16px 16px 4px", padding: "12px 16px" }}>分析中...</div>
+                    <div style={{ background: "#fff", border: "0.5px solid #e8e6e0", borderRadius: "16px 16px 16px 4px", padding: "12px 16px" }}>AI 分析中，約需 20–40 秒⋯</div>
                   </div>
                 )}
                 <div ref={chatEndRef} />
