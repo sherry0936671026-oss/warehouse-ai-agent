@@ -3,6 +3,11 @@ load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from ai_agent import run_warehouse_agent
+from agent_db import ensure_ready
+from tools.inventory_tools import get_inventory, check_safety_stock
+from tools.analytics_tools import get_kpi, get_anomalies
 from sqlmodel import Session, select
 from database import get_session, create_db
 from models import Warehouse, Item, ClaimEvent, EventLog
@@ -29,6 +34,44 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     create_db()
+    ensure_ready()  # 初始化 AI agent 資料庫
+
+
+class AgentChatRequest(BaseModel):
+    message: str
+
+
+@app.post("/agent/chat")
+def agent_chat(body: AgentChatRequest):
+    result = run_warehouse_agent(body.message)
+    return result
+
+
+@app.get("/agent/decision-log")
+def decision_log_demo():
+    """示範端點：對「全倉異常摘要」跑一次 agent 並回傳 decision log。"""
+    result = run_warehouse_agent("給我全倉的異常摘要")
+    return {"decision_log": result["decision_log"]}
+
+
+@app.get("/agent/inventory/{sku}")
+def agent_inventory(sku: str, warehouse_id: str = None):
+    return get_inventory(sku, warehouse_id)
+
+
+@app.get("/agent/safety-stock")
+def agent_safety_stock(warehouse_id: str = None):
+    return check_safety_stock(warehouse_id)
+
+
+@app.get("/agent/kpi/{warehouse_id}")
+def agent_kpi(warehouse_id: str):
+    return get_kpi(warehouse_id)
+
+
+@app.get("/agent/anomalies")
+def agent_anomalies():
+    return get_anomalies()
 
 # 取得所有倉庫
 @app.get("/warehouses")
