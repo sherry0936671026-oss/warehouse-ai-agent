@@ -9,3 +9,8 @@ frontend/node_modules/
 
 # 環境變數
 .env
+
+# 雜項
+.DS_Store
+frontend/dist/
+*.mp4
