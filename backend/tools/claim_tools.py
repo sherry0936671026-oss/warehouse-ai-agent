@@ -11,7 +11,7 @@ def get_claim(claim_id: str) -> dict:
           FROM claims c
           JOIN warehouses wp ON c.physical_wh = wp.id
           JOIN warehouses wa ON c.account_wh  = wa.id
-         WHERE c.claim_id=?
+         WHERE c.claim_id=%s
     """, (claim_id,)).fetchone()
     conn.close()
     return dict(row) if row else {"error": f"找不到 {claim_id}"}
@@ -32,10 +32,10 @@ def list_claims(status: str = None, warehouse_id: str = None) -> list:
     """
     params = []
     if status:
-        sql += " AND c.status=?"
+        sql += " AND c.status=%s"
         params.append(status)
     if warehouse_id:
-        sql += " AND (c.physical_wh=? OR c.account_wh=?)"
+        sql += " AND (c.physical_wh=%s OR c.account_wh=%s)"
         params.extend([warehouse_id, warehouse_id])
     sql += " ORDER BY c.created_at DESC"
     rows = conn.execute(sql, params).fetchall()
@@ -50,9 +50,9 @@ def get_duplicate_claims(sku: str, wh1: str, wh2: str, days: int = 7) -> dict:
         SELECT claim_id, claim_type, physical_wh, account_wh,
                shortage_qty, excess_qty, status, created_at
           FROM claims
-         WHERE (physical_wh=? OR account_wh=?)
-           AND (physical_wh=? OR account_wh=?)
-           AND created_at >= ?
+         WHERE (physical_wh=%s OR account_wh=%s)
+           AND (physical_wh=%s OR account_wh=%s)
+           AND created_at >= %s
          ORDER BY created_at DESC
     """, (wh1, wh1, wh2, wh2, cutoff)).fetchall()
     conn.close()

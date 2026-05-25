@@ -6,7 +6,7 @@ def _available_qty(warehouse_id: str, sku: str, conn) -> int:
         SELECT SUM(i.quantity) AS qty
           FROM inventory i
           JOIN storage_locations sl ON i.location_id = sl.location_id
-         WHERE sl.warehouse_id=? AND i.sku=?
+         WHERE sl.warehouse_id=%s AND i.sku=%s
            AND sl.zone_type IN ('PICKING','BUFFER')
            AND i.acct_status='AVAILABLE'
     """, (warehouse_id, sku)).fetchone()
@@ -15,14 +15,14 @@ def _available_qty(warehouse_id: str, sku: str, conn) -> int:
 
 def get_inventory(sku: str, warehouse_id: str = None) -> dict:
     conn = db.get_conn()
-    if not conn.execute("SELECT 1 FROM products WHERE sku=?", (sku,)).fetchone():
+    if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (sku,)).fetchone():
         conn.close()
         return {"error": f"找不到 SKU {sku}"}
 
-    product = conn.execute("SELECT * FROM products WHERE sku=?", (sku,)).fetchone()
+    product = conn.execute("SELECT * FROM products WHERE sku=%s", (sku,)).fetchone()
 
     if warehouse_id:
-        wh = conn.execute("SELECT * FROM warehouses WHERE id=?", (warehouse_id,)).fetchone()
+        wh = conn.execute("SELECT * FROM warehouses WHERE id=%s", (warehouse_id,)).fetchone()
         if not wh:
             conn.close()
             return {"error": f"找不到倉庫 {warehouse_id}"}
@@ -104,14 +104,16 @@ def check_safety_stock(warehouse_id: str = None) -> list:
           JOIN products p ON i.sku = p.sku
          WHERE sl.zone_type IN ('PICKING','BUFFER')
            AND i.acct_status = 'AVAILABLE'
-         GROUP BY sl.warehouse_id, i.sku
-        HAVING SUM(i.quantity) < p.safety_stock
     """
     params = []
     if warehouse_id:
-        sql += " AND sl.warehouse_id=?"
+        sql += " AND sl.warehouse_id=%s"
         params.append(warehouse_id)
-    sql += " ORDER BY shortage DESC"
-    rows = conn.execute(sql, params).fetchall()
+    sql += """
+         GROUP BY sl.warehouse_id, w.name, i.sku, p.name, p.unit, p.safety_stock
+        HAVING SUM(i.quantity) < p.safety_stock
+         ORDER BY shortage DESC
+    """
+    rows = conn.execute(sql, params or None).fetchall()
     conn.close()
     return [dict(r) for r in rows]

@@ -5,25 +5,25 @@ from tools.claim_tools import list_claims, get_claim_summary
 
 def get_kpi(warehouse_id: str) -> dict:
     conn = db.get_conn()
-    wh = conn.execute("SELECT * FROM warehouses WHERE id=?", (warehouse_id,)).fetchone()
+    wh = conn.execute("SELECT * FROM warehouses WHERE id=%s", (warehouse_id,)).fetchone()
     if not wh:
         conn.close()
         return {"error": f"找不到倉庫 {warehouse_id}"}
 
     total_claims = conn.execute(
-        "SELECT COUNT(*) FROM claims WHERE physical_wh=? OR account_wh=?",
+        "SELECT COUNT(*) AS n FROM claims WHERE physical_wh=%s OR account_wh=%s",
         (warehouse_id, warehouse_id)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     open_claims = conn.execute(
-        """SELECT COUNT(*) FROM claims
-            WHERE (physical_wh=? OR account_wh=?)
+        """SELECT COUNT(*) AS n FROM claims
+            WHERE (physical_wh=%s OR account_wh=%s)
               AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')""",
         (warehouse_id, warehouse_id)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     completed_transfers = conn.execute(
-        "SELECT COUNT(*) FROM transfer_orders WHERE (from_wh=? OR to_wh=?) AND status='COMPLETED'",
+        "SELECT COUNT(*) AS n FROM transfer_orders WHERE (from_wh=%s OR to_wh=%s) AND status='COMPLETED'",
         (warehouse_id, warehouse_id)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     conn.close()
 
     low_stock = check_safety_stock(warehouse_id)

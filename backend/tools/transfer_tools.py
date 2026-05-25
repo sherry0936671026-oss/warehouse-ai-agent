@@ -55,7 +55,7 @@ def get_transfer_history(sku: str) -> list:
           JOIN warehouses wf ON t.from_wh = wf.id
           JOIN warehouses wt ON t.to_wh   = wt.id
           JOIN transfer_order_details d ON t.order_id = d.order_id
-         WHERE d.sku=?
+         WHERE d.sku=%s
          ORDER BY t.created_at DESC
     """, (sku,)).fetchall()
     conn.close()
@@ -75,10 +75,10 @@ def list_transfers(status: str = None, warehouse_id: str = None) -> list:
     """
     params = []
     if status:
-        sql += " AND t.status=?"
+        sql += " AND t.status=%s"
         params.append(status)
     if warehouse_id:
-        sql += " AND (t.from_wh=? OR t.to_wh=?)"
+        sql += " AND (t.from_wh=%s OR t.to_wh=%s)"
         params.extend([warehouse_id, warehouse_id])
     sql += " ORDER BY t.created_at DESC"
     rows = conn.execute(sql, params).fetchall()

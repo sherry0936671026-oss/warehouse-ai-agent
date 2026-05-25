@@ -37,9 +37,9 @@ def _new_inbound_id() -> str:
     d = datetime.now().strftime("%Y%m%d")
     conn = db.get_conn()
     n = conn.execute(
-        "SELECT COUNT(*) FROM inbound_orders WHERE order_id LIKE ?",
+        "SELECT COUNT(*) AS n FROM inbound_orders WHERE order_id LIKE %s",
         (f"INB-{d}-%",)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     conn.close()
     return f"INB-{d}-{n+1:03d}"
 
@@ -50,9 +50,9 @@ def _new_claim_id(conn) -> str:
     """同一個 conn 內計數，避免同 transaction 中序號衝突。"""
     d = datetime.now().strftime("%Y%m%d")
     n = conn.execute(
-        "SELECT COUNT(*) FROM claims WHERE claim_id LIKE ?",
+        "SELECT COUNT(*) AS n FROM claims WHERE claim_id LIKE %s",
         (f"CLM-{d}-%",)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     return f"CLM-{d}-{n+1:03d}"
 
 
@@ -62,7 +62,7 @@ def _put_to_buffer(conn, warehouse_id: str, sku: str, qty: int,
                    t_code: str, created_by: str) -> str:
     """良品入 BUFFER（AVAILABLE）。"""
     loc = conn.execute(
-        "SELECT location_id FROM storage_locations WHERE warehouse_id=? AND zone_type='BUFFER' LIMIT 1",
+        "SELECT location_id FROM storage_locations WHERE warehouse_id=%s AND zone_type='BUFFER' LIMIT 1",
         (warehouse_id,)
     ).fetchone()
     if not loc:
@@ -71,9 +71,9 @@ def _put_to_buffer(conn, warehouse_id: str, sku: str, qty: int,
     to_loc = loc["location_id"]
     conn.execute("""
         INSERT INTO inventory(location_id,sku,quantity,acct_status,updated_at)
-             VALUES (?,?,?,'AVAILABLE',?)
+             VALUES (%s,%s,%s,'AVAILABLE',%s)
         ON CONFLICT(location_id,sku) DO UPDATE
-             SET quantity=quantity+?, updated_at=?
+             SET quantity=quantity+%s, updated_at=%s
     """, (to_loc, sku, qty, datetime.now().isoformat(),
           qty, datetime.now().isoformat()))
 
@@ -81,7 +81,7 @@ def _put_to_buffer(conn, warehouse_id: str, sku: str, qty: int,
     conn.execute("""
         INSERT INTO inventory_movements
           (movement_id,movement_type,from_location,to_location,sku,quantity,t_code,created_by,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (mvt_id, "INBOUND", None, to_loc,
           sku, qty, t_code, created_by, datetime.now().isoformat()))
     return mvt_id
@@ -91,7 +91,7 @@ def _put_to_problem(conn, warehouse_id: str, sku: str, qty: int,
                     t_code: str, created_by: str) -> str:
     """損壞品入 PROBLEM 區（FROZEN）。"""
     loc = conn.execute(
-        "SELECT location_id FROM storage_locations WHERE warehouse_id=? AND zone_type='PROBLEM' LIMIT 1",
+        "SELECT location_id FROM storage_locations WHERE warehouse_id=%s AND zone_type='PROBLEM' LIMIT 1",
         (warehouse_id,)
     ).fetchone()
     if not loc:
@@ -100,9 +100,9 @@ def _put_to_problem(conn, warehouse_id: str, sku: str, qty: int,
     to_loc = loc["location_id"]
     conn.execute("""
         INSERT INTO inventory(location_id,sku,quantity,acct_status,updated_at)
-             VALUES (?,?,?,'FROZEN',?)
+             VALUES (%s,%s,%s,'FROZEN',%s)
         ON CONFLICT(location_id,sku) DO UPDATE
-             SET quantity=quantity+?, updated_at=?
+             SET quantity=quantity+%s, updated_at=%s
     """, (to_loc, sku, qty, datetime.now().isoformat(),
           qty, datetime.now().isoformat()))
 
@@ -110,7 +110,7 @@ def _put_to_problem(conn, warehouse_id: str, sku: str, qty: int,
     conn.execute("""
         INSERT INTO inventory_movements
           (movement_id,movement_type,from_location,to_location,sku,quantity,t_code,created_by,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (mvt_id, "INBOUND", None, to_loc,
           sku, qty, t_code, created_by, datetime.now().isoformat()))
     return mvt_id
@@ -137,14 +137,14 @@ def _auto_claim(conn, t_code: str, claim_type: str,
           (claim_id,t_code,trigger_movement_id,claim_type,
            physical_wh,account_wh,initiated_by,responsible_party,
            shortage_qty,excess_qty,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (claim_id, t_code, trigger_mvt, claim_type,
           warehouse_id, warehouse_id, warehouse_id, responsible_party,
           shortage_qty, excess_qty, "PENDING", now))
 
     conn.execute("""
         INSERT INTO claim_logs(claim_id,action,actor,note,timestamp)
-        VALUES (?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s)
     """, (claim_id, "系統自動建立", "system", note, now))
 
     return claim_id
@@ -163,10 +163,10 @@ def list_inbound(warehouse_id: Optional[str] = None, status: Optional[str] = Non
     """
     params = []
     if warehouse_id:
-        sql += " AND o.warehouse_id=?"
+        sql += " AND o.warehouse_id=%s"
         params.append(warehouse_id)
     if status:
-        sql += " AND o.status=?"
+        sql += " AND o.status=%s"
         params.append(status)
     sql += " ORDER BY o.created_at DESC"
     rows = conn.execute(sql, params).fetchall()
@@ -181,7 +181,7 @@ def get_inbound(order_id: str):
         SELECT o.*, w.name AS warehouse_name
           FROM inbound_orders o
           JOIN warehouses w ON o.warehouse_id = w.id
-         WHERE o.order_id=?
+         WHERE o.order_id=%s
     """, (order_id,)).fetchone()
     if not order:
         conn.close()
@@ -191,14 +191,14 @@ def get_inbound(order_id: str):
         SELECT d.*, p.name AS product_name, p.unit
           FROM inbound_order_details d
           JOIN products p ON d.sku = p.sku
-         WHERE d.order_id=?
+         WHERE d.order_id=%s
     """, (order_id,)).fetchall()
 
     claims = conn.execute("""
         SELECT c.*, w.name AS warehouse_name
           FROM claims c
           JOIN warehouses w ON c.physical_wh = w.id
-         WHERE c.t_code=?
+         WHERE c.t_code=%s
     """, (order_id,)).fetchall()
 
     conn.close()
@@ -215,22 +215,22 @@ def create_inbound(body: InboundCreate):
         raise HTTPException(status_code=400, detail="至少填一個品項")
 
     conn = db.get_conn()
-    if not conn.execute("SELECT 1 FROM warehouses WHERE id=?", (body.warehouse_id,)).fetchone():
+    if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (body.warehouse_id,)).fetchone():
         conn.close()
         raise HTTPException(status_code=400, detail=f"倉庫 {body.warehouse_id} 不存在")
 
     order_id = _new_inbound_id()
     now = datetime.now().isoformat()
     conn.execute(
-        "INSERT INTO inbound_orders(order_id,warehouse_id,supplier,status,created_at,created_by) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO inbound_orders(order_id,warehouse_id,supplier,status,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s)",
         (order_id, body.warehouse_id, body.supplier, "DRAFT", now, body.created_by)
     )
     for d in body.details:
-        if not conn.execute("SELECT 1 FROM products WHERE sku=?", (d.sku,)).fetchone():
+        if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (d.sku,)).fetchone():
             conn.rollback(); conn.close()
             raise HTTPException(status_code=400, detail=f"品項 {d.sku} 不存在")
         conn.execute(
-            "INSERT INTO inbound_order_details(order_id,sku,qty_expected) VALUES (?,?,?)",
+            "INSERT INTO inbound_order_details(order_id,sku,qty_expected) VALUES (%s,%s,%s)",
             (order_id, d.sku, d.qty_expected)
         )
     conn.commit()
@@ -252,7 +252,7 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
     """
     conn = db.get_conn()
     order = conn.execute(
-        "SELECT * FROM inbound_orders WHERE order_id=?", (order_id,)
+        "SELECT * FROM inbound_orders WHERE order_id=%s", (order_id,)
     ).fetchone()
     if not order:
         conn.close()
@@ -273,7 +273,7 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
             raise HTTPException(status_code=400, detail="損壞數量不能超過實際到貨數量")
 
         detail = conn.execute(
-            "SELECT * FROM inbound_order_details WHERE id=? AND order_id=?",
+            "SELECT * FROM inbound_order_details WHERE id=%s AND order_id=%s",
             (item.detail_id, order_id)
         ).fetchone()
         if not detail:
@@ -289,8 +289,8 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
 
         conn.execute("""
             UPDATE inbound_order_details
-               SET qty_actual=?, shortage_qty=?, excess_qty=?, damage_qty=?
-             WHERE id=?
+               SET qty_actual=%s, shortage_qty=%s, excess_qty=%s, damage_qty=%s
+             WHERE id=%s
         """, (actual, shortage, excess, damage, item.detail_id))
 
         # 良品入 BUFFER
@@ -336,7 +336,7 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
             })
 
     conn.execute(
-        "UPDATE inbound_orders SET status='COMPLETED' WHERE order_id=?", (order_id,)
+        "UPDATE inbound_orders SET status='COMPLETED' WHERE order_id=%s", (order_id,)
     )
     conn.commit()
     conn.close()
@@ -353,7 +353,7 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
 def cancel_inbound(order_id: str):
     conn = db.get_conn()
     order = conn.execute(
-        "SELECT status FROM inbound_orders WHERE order_id=?", (order_id,)
+        "SELECT status FROM inbound_orders WHERE order_id=%s", (order_id,)
     ).fetchone()
     if not order:
         conn.close()
@@ -363,7 +363,7 @@ def cancel_inbound(order_id: str):
         raise HTTPException(status_code=400, detail="已完成的入庫單無法取消")
 
     conn.execute(
-        "UPDATE inbound_orders SET status='CANCELLED' WHERE order_id=?", (order_id,)
+        "UPDATE inbound_orders SET status='CANCELLED' WHERE order_id=%s", (order_id,)
     )
     conn.commit()
     conn.close()

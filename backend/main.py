@@ -84,7 +84,7 @@ def get_inventory_summary(warehouse_id: str = None):
     """
     params = []
     if warehouse_id:
-        sql += " AND sl.warehouse_id=?"
+        sql += " AND sl.warehouse_id=%s"
         params.append(warehouse_id)
     sql += " GROUP BY sl.warehouse_id, i.sku ORDER BY sl.warehouse_id, i.sku"
     rows = conn.execute(sql, params).fetchall()
@@ -110,7 +110,7 @@ def get_problem_stock(warehouse_id: str = None):
     """
     params = []
     if warehouse_id:
-        sql += " AND sl.warehouse_id=?"
+        sql += " AND sl.warehouse_id=%s"
         params.append(warehouse_id)
     sql += " ORDER BY sl.warehouse_id, sl.zone_type, i.sku"
     rows = conn.execute(sql, params).fetchall()
@@ -129,30 +129,30 @@ def get_dashboard():
     for wh in warehouses:
         wid = wh["id"]
         available = conn.execute("""
-            SELECT SUM(i.quantity) FROM inventory i
+            SELECT SUM(i.quantity) AS total FROM inventory i
               JOIN storage_locations sl ON i.location_id = sl.location_id
-             WHERE sl.warehouse_id=? AND sl.zone_type IN ('PICKING','BUFFER')
+             WHERE sl.warehouse_id=%s AND sl.zone_type IN ('PICKING','BUFFER')
                AND i.acct_status='AVAILABLE'
-        """, (wid,)).fetchone()[0] or 0
+        """, (wid,)).fetchone()["total"] or 0
 
         problem = conn.execute("""
-            SELECT SUM(i.quantity) FROM inventory i
+            SELECT SUM(i.quantity) AS total FROM inventory i
               JOIN storage_locations sl ON i.location_id = sl.location_id
-             WHERE sl.warehouse_id=? AND sl.zone_type IN ('PROBLEM','COLLECT_BUFFER','DISUSE')
+             WHERE sl.warehouse_id=%s AND sl.zone_type IN ('PROBLEM','COLLECT_BUFFER','DISUSE')
                AND i.quantity > 0
-        """, (wid,)).fetchone()[0] or 0
+        """, (wid,)).fetchone()["total"] or 0
 
         open_internal = conn.execute("""
-            SELECT COUNT(*) FROM claims
-             WHERE physical_wh=? AND physical_wh=account_wh
+            SELECT COUNT(*) AS n FROM claims
+             WHERE physical_wh=%s AND physical_wh=account_wh
                AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')
-        """, (wid,)).fetchone()[0]
+        """, (wid,)).fetchone()["n"]
 
         open_cross = conn.execute("""
-            SELECT COUNT(*) FROM claims
-             WHERE (physical_wh=? OR account_wh=?) AND physical_wh!=account_wh
+            SELECT COUNT(*) AS n FROM claims
+             WHERE (physical_wh=%s OR account_wh=%s) AND physical_wh!=account_wh
                AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')
-        """, (wid, wid)).fetchone()[0]
+        """, (wid, wid)).fetchone()["n"]
 
         wh_stats.append({
             "warehouse_id": wid,
@@ -173,17 +173,17 @@ def get_dashboard():
 
     # 待處理作業數
     pending_inbound = conn.execute(
-        "SELECT COUNT(*) FROM inbound_orders WHERE status='DRAFT'"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS n FROM inbound_orders WHERE status='DRAFT'"
+    ).fetchone()["n"]
     pending_transfers = conn.execute(
-        "SELECT COUNT(*) FROM transfer_orders WHERE status IN ('DRAFT','IN_TRANSIT')"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS n FROM transfer_orders WHERE status IN ('DRAFT','IN_TRANSIT')"
+    ).fetchone()["n"]
     pending_outbound = conn.execute(
-        "SELECT COUNT(*) FROM outbound_orders WHERE status='DRAFT'"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS n FROM outbound_orders WHERE status='DRAFT'"
+    ).fetchone()["n"]
     pending_counts = conn.execute(
-        "SELECT COUNT(*) FROM cycle_counts WHERE status='IN_PROGRESS'"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS n FROM cycle_counts WHERE status='IN_PROGRESS'"
+    ).fetchone()["n"]
 
     conn.close()
     return {

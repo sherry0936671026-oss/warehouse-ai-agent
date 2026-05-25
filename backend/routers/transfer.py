@@ -45,8 +45,8 @@ def _new_id(prefix: str, table: str, col: str) -> str:
     d = datetime.now().strftime("%Y%m%d")
     conn = db.get_conn()
     n = conn.execute(
-        f"SELECT COUNT(*) FROM {table} WHERE {col} LIKE ?", (f"{prefix}-{d}-%",)
-    ).fetchone()[0]
+        f"SELECT COUNT(*) AS n FROM {table} WHERE {col} LIKE %s", (f"{prefix}-{d}-%",)
+    ).fetchone()["n"]
     conn.close()
     return f"{prefix}-{d}-{n+1:03d}"
 
@@ -58,9 +58,9 @@ def _new_claim_id(conn) -> str:
     """同一個 conn 內計數，避免同 transaction 中序號衝突。"""
     d = datetime.now().strftime("%Y%m%d")
     n = conn.execute(
-        "SELECT COUNT(*) FROM claims WHERE claim_id LIKE ?",
+        "SELECT COUNT(*) AS n FROM claims WHERE claim_id LIKE %s",
         (f"CLM-{d}-%",)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     return f"CLM-{d}-{n+1:03d}"
 
 
@@ -80,8 +80,8 @@ def _deduct_inventory(conn, warehouse_id: str, sku: str, qty: int,
             SELECT i.id, i.location_id, i.quantity
               FROM inventory i
               JOIN storage_locations sl ON i.location_id = sl.location_id
-             WHERE sl.warehouse_id = ? AND sl.zone_type = ?
-               AND i.sku = ? AND i.acct_status = 'AVAILABLE' AND i.quantity > 0
+             WHERE sl.warehouse_id = %s AND sl.zone_type = %s
+               AND i.sku = %s AND i.acct_status = 'AVAILABLE' AND i.quantity > 0
              ORDER BY i.quantity DESC
         """, (warehouse_id, zone, sku)).fetchall()
 
@@ -90,14 +90,14 @@ def _deduct_inventory(conn, warehouse_id: str, sku: str, qty: int,
                 break
             take = min(row["quantity"], remaining)
             conn.execute(
-                "UPDATE inventory SET quantity = quantity - ?, updated_at = ? WHERE id = ?",
+                "UPDATE inventory SET quantity = quantity - %s, updated_at = %s WHERE id = %s",
                 (take, datetime.now().isoformat(), row["id"])
             )
             mvt_id = _new_mvt_id()
             conn.execute("""
                 INSERT INTO inventory_movements
                   (movement_id,movement_type,from_location,to_location,sku,quantity,t_code,created_by,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (mvt_id, "TRANSFER_OUT", row["location_id"], None,
                   sku, take, t_code, created_by, datetime.now().isoformat()))
             last_mvt = mvt_id
@@ -118,7 +118,7 @@ def _add_inventory(conn, warehouse_id: str, sku: str, qty: int,
                    t_code: str, created_by: str) -> str:
     """收到的貨放入 BUFFER（第一個 BUFFER 儲位）。回傳 movement_id。"""
     buf = conn.execute(
-        "SELECT location_id FROM storage_locations WHERE warehouse_id=? AND zone_type='BUFFER' LIMIT 1",
+        "SELECT location_id FROM storage_locations WHERE warehouse_id=%s AND zone_type='BUFFER' LIMIT 1",
         (warehouse_id,)
     ).fetchone()
     if not buf:
@@ -127,9 +127,9 @@ def _add_inventory(conn, warehouse_id: str, sku: str, qty: int,
     to_loc = buf["location_id"]
     conn.execute("""
         INSERT INTO inventory(location_id,sku,quantity,acct_status,updated_at)
-             VALUES (?,?,?,'AVAILABLE',?)
+             VALUES (%s,%s,%s,'AVAILABLE',%s)
         ON CONFLICT(location_id,sku) DO UPDATE
-             SET quantity = quantity + ?, updated_at = ?
+             SET quantity = quantity + %s, updated_at = %s
     """, (to_loc, sku, qty, datetime.now().isoformat(),
           qty, datetime.now().isoformat()))
 
@@ -137,7 +137,7 @@ def _add_inventory(conn, warehouse_id: str, sku: str, qty: int,
     conn.execute("""
         INSERT INTO inventory_movements
           (movement_id,movement_type,from_location,to_location,sku,quantity,t_code,created_by,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (mvt_id, "TRANSFER_IN", None, to_loc,
           sku, qty, t_code, created_by, datetime.now().isoformat()))
     return mvt_id
@@ -159,14 +159,14 @@ def _auto_shortage_claim(conn, order_id: str, from_wh: str, to_wh: str,
           (claim_id,t_code,trigger_movement_id,claim_type,
            physical_wh,account_wh,initiated_by,responsible_party,
            shortage_qty,excess_qty,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (claim_id, order_id, trigger_mvt, "TRANSFER_SHORTAGE",
           to_wh, from_wh, to_wh, "ORIGIN_WH",
           shortage_qty, 0, "PENDING", now))
 
     conn.execute("""
         INSERT INTO claim_logs(claim_id,action,actor,note,timestamp)
-        VALUES (?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s)
     """, (claim_id, "系統自動建立", "system",
           f"調撥單 {order_id} {sku} 短少 {shortage_qty} 個，責任倉：{from_wh}", now))
 
@@ -189,10 +189,10 @@ def list_transfers(warehouse_id: Optional[str] = None, status: Optional[str] = N
     """
     params = []
     if warehouse_id:
-        sql += " AND (t.from_wh=? OR t.to_wh=?)"
+        sql += " AND (t.from_wh=%s OR t.to_wh=%s)"
         params += [warehouse_id, warehouse_id]
     if status:
-        sql += " AND t.status=?"
+        sql += " AND t.status=%s"
         params.append(status)
     sql += " ORDER BY t.created_at DESC"
     rows = conn.execute(sql, params).fetchall()
@@ -209,7 +209,7 @@ def get_transfer(order_id: str):
           FROM transfer_orders t
           JOIN warehouses w1 ON t.from_wh = w1.id
           JOIN warehouses w2 ON t.to_wh   = w2.id
-         WHERE t.order_id = ?
+         WHERE t.order_id = %s
     """, (order_id,)).fetchone()
     if not order:
         conn.close()
@@ -219,7 +219,7 @@ def get_transfer(order_id: str):
         SELECT d.*, p.name AS product_name, p.unit
           FROM transfer_order_details d
           JOIN products p ON d.sku = p.sku
-         WHERE d.order_id = ?
+         WHERE d.order_id = %s
     """, (order_id,)).fetchall()
 
     claims = conn.execute("""
@@ -229,7 +229,7 @@ def get_transfer(order_id: str):
           FROM claims c
           JOIN warehouses w1 ON c.physical_wh = w1.id
           JOIN warehouses w2 ON c.account_wh  = w2.id
-         WHERE c.t_code = ?
+         WHERE c.t_code = %s
     """, (order_id,)).fetchall()
 
     conn.close()
@@ -249,22 +249,22 @@ def create_transfer(body: TransferCreate):
 
     conn = db.get_conn()
     for wh in (body.from_wh, body.to_wh):
-        if not conn.execute("SELECT 1 FROM warehouses WHERE id=?", (wh,)).fetchone():
+        if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (wh,)).fetchone():
             conn.close()
             raise HTTPException(status_code=400, detail=f"倉庫 {wh} 不存在")
 
     order_id = _new_id("TRF", "transfer_orders", "order_id")
     now = datetime.now().isoformat()
     conn.execute(
-        "INSERT INTO transfer_orders(order_id,from_wh,to_wh,status,ref_doc,created_at,created_by) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO transfer_orders(order_id,from_wh,to_wh,status,ref_doc,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (order_id, body.from_wh, body.to_wh, "DRAFT", body.ref_doc, now, body.created_by)
     )
     for d in body.details:
-        if not conn.execute("SELECT 1 FROM products WHERE sku=?", (d.sku,)).fetchone():
+        if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (d.sku,)).fetchone():
             conn.rollback(); conn.close()
             raise HTTPException(status_code=400, detail=f"品項 {d.sku} 不存在")
         conn.execute(
-            "INSERT INTO transfer_order_details(order_id,sku,qty_ordered) VALUES (?,?,?)",
+            "INSERT INTO transfer_order_details(order_id,sku,qty_ordered) VALUES (%s,%s,%s)",
             (order_id, d.sku, d.qty_ordered)
         )
     conn.commit()
@@ -281,7 +281,7 @@ def issue_transfer(order_id: str, body: IssueRequest):
     """
     conn = db.get_conn()
     order = conn.execute(
-        "SELECT * FROM transfer_orders WHERE order_id=?", (order_id,)
+        "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
     ).fetchone()
     if not order:
         conn.close()
@@ -292,7 +292,7 @@ def issue_transfer(order_id: str, body: IssueRequest):
 
     for item in body.details:
         detail = conn.execute(
-            "SELECT * FROM transfer_order_details WHERE id=? AND order_id=?",
+            "SELECT * FROM transfer_order_details WHERE id=%s AND order_id=%s",
             (item.detail_id, order_id)
         ).fetchone()
         if not detail:
@@ -300,14 +300,14 @@ def issue_transfer(order_id: str, body: IssueRequest):
             raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
 
         conn.execute(
-            "UPDATE transfer_order_details SET qty_issued=? WHERE id=?",
+            "UPDATE transfer_order_details SET qty_issued=%s WHERE id=%s",
             (item.qty_issued, item.detail_id)
         )
         _deduct_inventory(conn, order["from_wh"], detail["sku"],
                           item.qty_issued, order_id, body.created_by)
 
     conn.execute(
-        "UPDATE transfer_orders SET status='IN_TRANSIT' WHERE order_id=?", (order_id,)
+        "UPDATE transfer_orders SET status='IN_TRANSIT' WHERE order_id=%s", (order_id,)
     )
     conn.commit()
     conn.close()
@@ -326,7 +326,7 @@ def receive_transfer(order_id: str, body: ReceiveRequest):
     """
     conn = db.get_conn()
     order = conn.execute(
-        "SELECT * FROM transfer_orders WHERE order_id=?", (order_id,)
+        "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
     ).fetchone()
     if not order:
         conn.close()
@@ -340,7 +340,7 @@ def receive_transfer(order_id: str, body: ReceiveRequest):
 
     for item in body.details:
         detail = conn.execute(
-            "SELECT * FROM transfer_order_details WHERE id=? AND order_id=?",
+            "SELECT * FROM transfer_order_details WHERE id=%s AND order_id=%s",
             (item.detail_id, order_id)
         ).fetchone()
         if not detail:
@@ -354,8 +354,8 @@ def receive_transfer(order_id: str, body: ReceiveRequest):
 
         conn.execute("""
             UPDATE transfer_order_details
-               SET qty_received=?, shortage_qty=?, excess_qty=?
-             WHERE id=?
+               SET qty_received=%s, shortage_qty=%s, excess_qty=%s
+             WHERE id=%s
         """, (received, shortage, excess, item.detail_id))
 
         mvt_id = _add_inventory(conn, order["to_wh"], detail["sku"],
@@ -380,7 +380,7 @@ def receive_transfer(order_id: str, body: ReceiveRequest):
             })
 
     conn.execute(
-        "UPDATE transfer_orders SET status='RECEIVED' WHERE order_id=?", (order_id,)
+        "UPDATE transfer_orders SET status='RECEIVED' WHERE order_id=%s", (order_id,)
     )
     conn.commit()
     conn.close()
@@ -401,7 +401,7 @@ def complete_transfer(order_id: str):
     """
     conn = db.get_conn()
     order = conn.execute(
-        "SELECT * FROM transfer_orders WHERE order_id=?", (order_id,)
+        "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
     ).fetchone()
     if not order:
         conn.close()
@@ -411,9 +411,9 @@ def complete_transfer(order_id: str):
         raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法結單")
 
     open_n = conn.execute("""
-        SELECT COUNT(*) FROM claims
-         WHERE t_code=? AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')
-    """, (order_id,)).fetchone()[0]
+        SELECT COUNT(*) AS n FROM claims
+         WHERE t_code=%s AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')
+    """, (order_id,)).fetchone()["n"]
     if open_n > 0:
         conn.close()
         raise HTTPException(
@@ -422,7 +422,7 @@ def complete_transfer(order_id: str):
         )
 
     conn.execute(
-        "UPDATE transfer_orders SET status='COMPLETED' WHERE order_id=?", (order_id,)
+        "UPDATE transfer_orders SET status='COMPLETED' WHERE order_id=%s", (order_id,)
     )
     conn.commit()
     conn.close()

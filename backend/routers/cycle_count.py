@@ -33,9 +33,9 @@ def _new_count_id() -> str:
     d = datetime.now().strftime("%Y%m%d")
     conn = db.get_conn()
     n = conn.execute(
-        "SELECT COUNT(*) FROM cycle_counts WHERE count_id LIKE ?",
+        "SELECT COUNT(*) AS n FROM cycle_counts WHERE count_id LIKE %s",
         (f"CNT-{d}-%",)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     conn.close()
     return f"CNT-{d}-{n+1:03d}"
 
@@ -45,9 +45,9 @@ def _new_mvt_id() -> str:
 def _new_claim_id(conn) -> str:
     d = datetime.now().strftime("%Y%m%d")
     n = conn.execute(
-        "SELECT COUNT(*) FROM claims WHERE claim_id LIKE ?",
+        "SELECT COUNT(*) AS n FROM claims WHERE claim_id LIKE %s",
         (f"CLM-{d}-%",)
-    ).fetchone()[0]
+    ).fetchone()["n"]
     return f"CLM-{d}-{n+1:03d}"
 
 
@@ -67,7 +67,7 @@ def _snapshot_inventory(conn, warehouse_id: str,
         sql = """
             SELECT i.location_id, i.sku, i.quantity AS qty_system
               FROM inventory i
-             WHERE i.location_id = ?
+             WHERE i.location_id = %s
                AND i.acct_status = 'AVAILABLE'
                AND i.quantity > 0
         """
@@ -77,7 +77,7 @@ def _snapshot_inventory(conn, warehouse_id: str,
             SELECT i.location_id, i.sku, i.quantity AS qty_system
               FROM inventory i
               JOIN storage_locations sl ON i.location_id = sl.location_id
-             WHERE sl.warehouse_id = ?
+             WHERE sl.warehouse_id = %s
                AND sl.zone_type IN ('PICKING','BUFFER')
                AND i.acct_status = 'AVAILABLE'
                AND i.quantity > 0
@@ -85,7 +85,7 @@ def _snapshot_inventory(conn, warehouse_id: str,
         params = [warehouse_id]
 
     if skus:
-        placeholders = ",".join("?" * len(skus))
+        placeholders = ",".join(["%s"] * len(skus))
         sql += f" AND i.sku IN ({placeholders})"
         params += skus
 
@@ -107,16 +107,16 @@ def _apply_count_adj(conn, location_id: str, sku: str,
         return None
 
     conn.execute(
-        "UPDATE inventory SET quantity=?, updated_at=? WHERE location_id=? AND sku=?",
+        "UPDATE inventory SET quantity=%s, updated_at=%s WHERE location_id=%s AND sku=%s",
         (qty_actual, datetime.now().isoformat(), location_id, sku)
     )
 
     # 若 qty_actual == 0 且 row 不存在，先 upsert
     conn.execute("""
         INSERT INTO inventory(location_id,sku,quantity,acct_status,updated_at)
-             VALUES (?,?,?,'AVAILABLE',?)
+             VALUES (%s,%s,%s,'AVAILABLE',%s)
         ON CONFLICT(location_id,sku) DO UPDATE
-             SET quantity=?, updated_at=?
+             SET quantity=%s, updated_at=%s
     """, (location_id, sku, qty_actual, datetime.now().isoformat(),
           qty_actual, datetime.now().isoformat()))
 
@@ -127,7 +127,7 @@ def _apply_count_adj(conn, location_id: str, sku: str,
     conn.execute("""
         INSERT INTO inventory_movements
           (movement_id,movement_type,from_location,to_location,sku,quantity,t_code,created_by,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (mvt_id, "COUNT_ADJ", from_loc, to_loc,
           sku, abs(delta), t_code, created_by, datetime.now().isoformat()))
     return mvt_id
@@ -149,13 +149,13 @@ def _auto_discrepancy_claim(conn, t_code: str, warehouse_id: str,
           (claim_id,t_code,trigger_movement_id,claim_type,
            physical_wh,account_wh,initiated_by,responsible_party,
            shortage_qty,excess_qty,status,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (claim_id, t_code, trigger_mvt, "COUNT_DISCREPANCY",
           warehouse_id, warehouse_id, warehouse_id, "SELF",
           shortage_qty, 0, "PENDING", now))
     conn.execute("""
         INSERT INTO claim_logs(claim_id,action,actor,note,timestamp)
-        VALUES (?,?,?,?,?)
+        VALUES (%s,%s,%s,%s,%s)
     """, (claim_id, "系統自動建立", "system",
           f"盤點 {t_code}｜{location_id} {sku} 短少 {shortage_qty} 個", now))
     return claim_id
@@ -178,12 +178,12 @@ def list_cycle_counts(warehouse_id: Optional[str] = None,
     """
     params = []
     if warehouse_id:
-        sql += " AND c.warehouse_id=?"
+        sql += " AND c.warehouse_id=%s"
         params.append(warehouse_id)
     if status:
-        sql += " AND c.status=?"
+        sql += " AND c.status=%s"
         params.append(status)
-    sql += " GROUP BY c.count_id ORDER BY c.created_at DESC"
+    sql += " GROUP BY c.count_id, w.name ORDER BY c.created_at DESC"
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -196,7 +196,7 @@ def get_cycle_count(count_id: str):
         SELECT c.*, w.name AS warehouse_name
           FROM cycle_counts c
           JOIN warehouses w ON c.warehouse_id = w.id
-         WHERE c.count_id=?
+         WHERE c.count_id=%s
     """, (count_id,)).fetchone()
     if not count:
         conn.close()
@@ -209,7 +209,7 @@ def get_cycle_count(count_id: str):
           FROM cycle_count_details d
           JOIN products p ON d.sku = p.sku
           JOIN storage_locations sl ON d.location_id = sl.location_id
-         WHERE d.count_id=?
+         WHERE d.count_id=%s
          ORDER BY d.location_id, d.sku
     """, (count_id,)).fetchall()
 
@@ -217,7 +217,7 @@ def get_cycle_count(count_id: str):
         SELECT c.*, w.name AS warehouse_name
           FROM claims c
           JOIN warehouses w ON c.physical_wh = w.id
-         WHERE c.t_code=?
+         WHERE c.t_code=%s
     """, (count_id,)).fetchall()
 
     conn.close()
@@ -236,13 +236,13 @@ def create_cycle_count(body: CycleCountCreate):
     - 不指定 → 盤整倉 PICKING + BUFFER 層
     """
     conn = db.get_conn()
-    if not conn.execute("SELECT 1 FROM warehouses WHERE id=?", (body.warehouse_id,)).fetchone():
+    if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (body.warehouse_id,)).fetchone():
         conn.close()
         raise HTTPException(status_code=400, detail=f"倉庫 {body.warehouse_id} 不存在")
 
     if body.location_id:
         loc = conn.execute(
-            "SELECT * FROM storage_locations WHERE location_id=? AND warehouse_id=?",
+            "SELECT * FROM storage_locations WHERE location_id=%s AND warehouse_id=%s",
             (body.location_id, body.warehouse_id)
         ).fetchone()
         if not loc:
@@ -258,13 +258,13 @@ def create_cycle_count(body: CycleCountCreate):
     count_id = _new_count_id()
     now = datetime.now().isoformat()
     conn.execute(
-        "INSERT INTO cycle_counts(count_id,warehouse_id,count_type,location_id,status,created_at,created_by) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO cycle_counts(count_id,warehouse_id,count_type,location_id,status,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (count_id, body.warehouse_id, body.count_type,
          body.location_id, "IN_PROGRESS", now, body.created_by)
     )
     for row in rows:
         conn.execute(
-            "INSERT INTO cycle_count_details(count_id,location_id,sku,qty_system) VALUES (?,?,?,?)",
+            "INSERT INTO cycle_count_details(count_id,location_id,sku,qty_system) VALUES (%s,%s,%s,%s)",
             (count_id, row["location_id"], row["sku"], row["qty_system"])
         )
     conn.commit()
@@ -290,7 +290,7 @@ def submit_cycle_count(count_id: str, body: SubmitRequest):
     """
     conn = db.get_conn()
     count = conn.execute(
-        "SELECT * FROM cycle_counts WHERE count_id=?", (count_id,)
+        "SELECT * FROM cycle_counts WHERE count_id=%s", (count_id,)
     ).fetchone()
     if not count:
         conn.close()
@@ -309,7 +309,7 @@ def submit_cycle_count(count_id: str, body: SubmitRequest):
             raise HTTPException(status_code=400, detail="實際數量不能為負數")
 
         detail = conn.execute(
-            "SELECT * FROM cycle_count_details WHERE id=? AND count_id=?",
+            "SELECT * FROM cycle_count_details WHERE id=%s AND count_id=%s",
             (item.detail_id, count_id)
         ).fetchone()
         if not detail:
@@ -321,7 +321,7 @@ def submit_cycle_count(count_id: str, body: SubmitRequest):
         difference = qty_actual - qty_system
 
         conn.execute(
-            "UPDATE cycle_count_details SET qty_actual=?, difference=? WHERE id=?",
+            "UPDATE cycle_count_details SET qty_actual=%s, difference=%s WHERE id=%s",
             (qty_actual, difference, item.detail_id)
         )
 
@@ -354,7 +354,7 @@ def submit_cycle_count(count_id: str, body: SubmitRequest):
             clean_lines += 1
 
     conn.execute(
-        "UPDATE cycle_counts SET status='COMPLETED' WHERE count_id=?", (count_id,)
+        "UPDATE cycle_counts SET status='COMPLETED' WHERE count_id=%s", (count_id,)
     )
     conn.commit()
     conn.close()
@@ -372,7 +372,7 @@ def submit_cycle_count(count_id: str, body: SubmitRequest):
 def cancel_cycle_count(count_id: str):
     conn = db.get_conn()
     count = conn.execute(
-        "SELECT status FROM cycle_counts WHERE count_id=?", (count_id,)
+        "SELECT status FROM cycle_counts WHERE count_id=%s", (count_id,)
     ).fetchone()
     if not count:
         conn.close()
@@ -382,7 +382,7 @@ def cancel_cycle_count(count_id: str):
         raise HTTPException(status_code=400, detail="已完成的盤點單無法取消")
 
     conn.execute(
-        "UPDATE cycle_counts SET status='CANCELLED' WHERE count_id=?", (count_id,)
+        "UPDATE cycle_counts SET status='CANCELLED' WHERE count_id=%s", (count_id,)
     )
     conn.commit()
     conn.close()
