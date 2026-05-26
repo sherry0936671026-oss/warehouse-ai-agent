@@ -134,14 +134,18 @@ npm run dev                     # 啟動於 http://localhost:5173
 
 1. [Railway](https://railway.app) 新建 project → 連接此 repo
 2. Root directory 設為 `backend`
-3. 環境變數：`ANTHROPIC_API_KEY`、`GROQ_API_KEY`
-4. Railway 自動偵測 `Procfile` 啟動
+3. 在專案內點 **+ New → Database → Add PostgreSQL**
+4. 後端 service Variables 新增：
+   - `ANTHROPIC_API_KEY`：你的 Anthropic API Key
+   - `DATABASE_URL`：點 Reference → 選 `Postgres` → `DATABASE_URL`
+5. Railway 自動偵測 `Procfile` 啟動，首次部署會自動建表並填入種子資料
 
 ### Frontend → Netlify
 
 1. [Netlify](https://netlify.com) 連接此 repo
-2. Base: `frontend`，Build: `npm run build`，Publish: `dist`
-3. 環境變數：`VITE_API_URL=https://你的railway網址.up.railway.app`
+2. Site configuration → Build & deploy：Base `frontend`，Build `npm run build`，Publish `dist`
+3. Environment variables 新增：`VITE_API_URL=https://你的railway網址.up.railway.app`
+4. 重新部署生效
 
 ---
 
