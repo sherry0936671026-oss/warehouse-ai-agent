@@ -44,43 +44,41 @@ def suggest_transfer(sku: str, to_warehouse: str) -> dict:
 
 
 def get_transfer_history(sku: str) -> list:
-    conn = db.get_conn()
-    rows = conn.execute("""
-        SELECT t.order_id, t.from_wh, wf.name AS from_name,
-               t.to_wh, wt.name AS to_name,
-               t.status, t.created_at,
-               d.sku, d.qty_ordered, d.qty_issued, d.qty_received,
-               d.shortage_qty, d.excess_qty
-          FROM transfer_orders t
-          JOIN warehouses wf ON t.from_wh = wf.id
-          JOIN warehouses wt ON t.to_wh   = wt.id
-          JOIN transfer_order_details d ON t.order_id = d.order_id
-         WHERE d.sku=%s
-         ORDER BY t.created_at DESC
-    """, (sku,)).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT t.order_id, t.from_wh, wf.name AS from_name,
+                   t.to_wh, wt.name AS to_name,
+                   t.status, t.created_at,
+                   d.sku, d.qty_ordered, d.qty_issued, d.qty_received,
+                   d.shortage_qty, d.excess_qty
+              FROM transfer_orders t
+              JOIN warehouses wf ON t.from_wh = wf.id
+              JOIN warehouses wt ON t.to_wh   = wt.id
+              JOIN transfer_order_details d ON t.order_id = d.order_id
+             WHERE d.sku=%s
+             ORDER BY t.created_at DESC
+        """, (sku,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def list_transfers(status: str = None, warehouse_id: str = None) -> list:
-    conn = db.get_conn()
-    sql = """
-        SELECT t.order_id, t.from_wh, wf.name AS from_name,
-               t.to_wh, wt.name AS to_name,
-               t.status, t.created_at
-          FROM transfer_orders t
-          JOIN warehouses wf ON t.from_wh = wf.id
-          JOIN warehouses wt ON t.to_wh   = wt.id
-         WHERE 1=1
-    """
-    params = []
-    if status:
-        sql += " AND t.status=%s"
-        params.append(status)
-    if warehouse_id:
-        sql += " AND (t.from_wh=%s OR t.to_wh=%s)"
-        params.extend([warehouse_id, warehouse_id])
-    sql += " ORDER BY t.created_at DESC"
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        sql = """
+            SELECT t.order_id, t.from_wh, wf.name AS from_name,
+                   t.to_wh, wt.name AS to_name,
+                   t.status, t.created_at
+              FROM transfer_orders t
+              JOIN warehouses wf ON t.from_wh = wf.id
+              JOIN warehouses wt ON t.to_wh   = wt.id
+             WHERE 1=1
+        """
+        params = []
+        if status:
+            sql += " AND t.status=%s"
+            params.append(status)
+        if warehouse_id:
+            sql += " AND (t.from_wh=%s OR t.to_wh=%s)"
+            params.extend([warehouse_id, warehouse_id])
+        sql += " ORDER BY t.created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]

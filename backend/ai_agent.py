@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Optional
 import anthropic
 from harness import WarehouseHarness
 from tools.inventory_tools import get_inventory, compare_inventory, check_safety_stock
@@ -58,7 +59,7 @@ CLAIM_TOOLS = [
     },
     {
         "name": "list_claims",
-        "description": "列出異議單，可按狀態（待審查/異議中/已結案/已拒絕）或倉庫篩選",
+        "description": "列出異議單，可按狀態（PENDING/INVESTIGATING/RESOLVED 等）或倉庫篩選",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -155,11 +156,19 @@ TOOL_REGISTRY = {
     "get_anomalies": get_anomalies,
 }
 
+# ── 對話歷史 ─────────────────────────────────────────────────────────────────
+# key: session_id, value: list of {"role": "user"|"assistant", "content": str}
+_sessions: dict[str, list[dict]] = {}
+_MAX_HISTORY = 20  # 最多保留 10 輪對話
+
+
 # ── 子 Agent 執行器────────────────────────────────────────────────────────────
 
-def _run_sub_agent(system: str, tools: list, user_message: str, harness: WarehouseHarness) -> str:
+def _run_sub_agent(system: str, tools: list, user_message: str,
+                   harness: WarehouseHarness,
+                   history: Optional[list] = None) -> str:
     """執行一個子 Agent，處理 tool use 迴圈，透過 harness 驗證每次工具呼叫。"""
-    messages = [{"role": "user", "content": user_message}]
+    messages = list(history or []) + [{"role": "user", "content": user_message}]
 
     response = client.messages.create(
         model=MODEL, max_tokens=2048, system=system, tools=tools, messages=messages
@@ -213,9 +222,16 @@ def _route(user_message: str) -> list[str]:
 
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
-def run_warehouse_agent(user_message: str) -> dict:
+def run_warehouse_agent(user_message: str, session_id: Optional[str] = None) -> dict:
     harness = WarehouseHarness()
     harness.add_reasoning("start", f"收到問題：{user_message}")
+
+    # 取得對話歷史（純文字輪次，不含 tool_use blocks）
+    history: list[dict] = []
+    if session_id:
+        history = list(_sessions.get(session_id, []))
+        if history:
+            harness.add_reasoning("history", f"載入 {len(history)//2} 輪對話歷史")
 
     categories = _route(user_message)
     if not categories:
@@ -245,7 +261,7 @@ def run_warehouse_agent(user_message: str) -> dict:
     for cat in categories:
         system, tools = agent_configs[cat]
         harness.add_reasoning("invoke", f"啟動 {cat} Agent")
-        results[cat] = _run_sub_agent(system, tools, user_message, harness)
+        results[cat] = _run_sub_agent(system, tools, user_message, harness, history)
 
     if len(results) == 1:
         reply = list(results.values())[0]
@@ -253,17 +269,26 @@ def run_warehouse_agent(user_message: str) -> dict:
     else:
         context = "\n\n".join(f"【{k} Agent】\n{v}" for k, v in results.items())
         harness.add_reasoning("integrate", f"整合 {len(results)} 個子 Agent 結果")
+        integrate_messages = list(history) + [{
+            "role": "user",
+            "content": f"使用者問題：{user_message}\n\n各 Agent 分析：\n{context}\n\n請整合以上資訊給出完整回答。",
+        }]
         final = client.messages.create(
             model=MODEL,
             max_tokens=2048,
             system="你是倉庫總 Agent，整合多個子 Agent 的分析，給出完整且結構清晰的回答。用繁體中文。",
-            messages=[{
-                "role": "user",
-                "content": f"使用者問題：{user_message}\n\n各 Agent 分析：\n{context}\n\n請整合以上資訊給出完整回答。",
-            }],
+            messages=integrate_messages,
         )
         reply = final.content[0].text
         harness.add_reasoning("done", "整合完成")
+
+    # 儲存對話歷史
+    if session_id is not None:
+        buf = _sessions.setdefault(session_id, [])
+        buf.append({"role": "user", "content": user_message})
+        buf.append({"role": "assistant", "content": reply})
+        if len(buf) > _MAX_HISTORY:
+            _sessions[session_id] = buf[-_MAX_HISTORY:]
 
     return {
         "reply": reply,

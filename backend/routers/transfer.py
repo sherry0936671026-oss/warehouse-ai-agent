@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
+from uuid import uuid4
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import db
@@ -41,27 +42,14 @@ class ReceiveRequest(BaseModel):
 
 # ── ID Generators ─────────────────────────────────────────────────────────────
 
-def _new_id(prefix: str, table: str, col: str) -> str:
-    d = datetime.now().strftime("%Y%m%d")
-    conn = db.get_conn()
-    n = conn.execute(
-        f"SELECT COUNT(*) AS n FROM {table} WHERE {col} LIKE %s", (f"{prefix}-{d}-%",)
-    ).fetchone()["n"]
-    conn.close()
-    return f"{prefix}-{d}-{n+1:03d}"
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 def _new_mvt_id() -> str:
-    """微秒級唯一 ID，避免同秒衝突。"""
     return f"MVT-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-def _new_claim_id(conn) -> str:
-    """同一個 conn 內計數，避免同 transaction 中序號衝突。"""
-    d = datetime.now().strftime("%Y%m%d")
-    n = conn.execute(
-        "SELECT COUNT(*) AS n FROM claims WHERE claim_id LIKE %s",
-        (f"CLM-{d}-%",)
-    ).fetchone()["n"]
-    return f"CLM-{d}-{n+1:03d}"
+def _new_claim_id() -> str:
+    return f"CLM-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 
 # ── Inventory Helpers ─────────────────────────────────────────────────────────
@@ -147,12 +135,7 @@ def _add_inventory(conn, warehouse_id: str, sku: str, qty: int,
 
 def _auto_shortage_claim(conn, order_id: str, from_wh: str, to_wh: str,
                          sku: str, shortage_qty: int, trigger_mvt: str) -> str:
-    """
-    轉倉收貨短少 → 自動建 TRANSFER_SHORTAGE Claim。
-    physical_wh = 收貨倉（東西理論上應在這裡）
-    account_wh  = 發貨倉（負責補足差異）
-    """
-    claim_id = _new_claim_id(conn)
+    claim_id = _new_claim_id()
     now = datetime.now().isoformat()
     conn.execute("""
         INSERT INTO claims
@@ -177,62 +160,59 @@ def _auto_shortage_claim(conn, order_id: str, from_wh: str, to_wh: str,
 
 @router.get("")
 def list_transfers(warehouse_id: Optional[str] = None, status: Optional[str] = None):
-    conn = db.get_conn()
-    sql = """
-        SELECT t.*,
-               w1.name AS from_name, w1.location AS from_location,
-               w2.name AS to_name,   w2.location AS to_location
-          FROM transfer_orders t
-          JOIN warehouses w1 ON t.from_wh = w1.id
-          JOIN warehouses w2 ON t.to_wh   = w2.id
-         WHERE 1=1
-    """
-    params = []
-    if warehouse_id:
-        sql += " AND (t.from_wh=%s OR t.to_wh=%s)"
-        params += [warehouse_id, warehouse_id]
-    if status:
-        sql += " AND t.status=%s"
-        params.append(status)
-    sql += " ORDER BY t.created_at DESC"
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        sql = """
+            SELECT t.*,
+                   w1.name AS from_name, w1.location AS from_location,
+                   w2.name AS to_name,   w2.location AS to_location
+              FROM transfer_orders t
+              JOIN warehouses w1 ON t.from_wh = w1.id
+              JOIN warehouses w2 ON t.to_wh   = w2.id
+             WHERE 1=1
+        """
+        params = []
+        if warehouse_id:
+            sql += " AND (t.from_wh=%s OR t.to_wh=%s)"
+            params += [warehouse_id, warehouse_id]
+        if status:
+            sql += " AND t.status=%s"
+            params.append(status)
+        sql += " ORDER BY t.created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/{order_id}")
 def get_transfer(order_id: str):
-    conn = db.get_conn()
-    order = conn.execute("""
-        SELECT t.*,
-               w1.name AS from_name, w2.name AS to_name
-          FROM transfer_orders t
-          JOIN warehouses w1 ON t.from_wh = w1.id
-          JOIN warehouses w2 ON t.to_wh   = w2.id
-         WHERE t.order_id = %s
-    """, (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="調撥單不存在")
+    with db.get_conn() as conn:
+        order = conn.execute("""
+            SELECT t.*,
+                   w1.name AS from_name, w2.name AS to_name
+              FROM transfer_orders t
+              JOIN warehouses w1 ON t.from_wh = w1.id
+              JOIN warehouses w2 ON t.to_wh   = w2.id
+             WHERE t.order_id = %s
+        """, (order_id,)).fetchone()
+        if not order:
+            raise HTTPException(status_code=404, detail="調撥單不存在")
 
-    details = conn.execute("""
-        SELECT d.*, p.name AS product_name, p.unit
-          FROM transfer_order_details d
-          JOIN products p ON d.sku = p.sku
-         WHERE d.order_id = %s
-    """, (order_id,)).fetchall()
+        details = conn.execute("""
+            SELECT d.*, p.name AS product_name, p.unit
+              FROM transfer_order_details d
+              JOIN products p ON d.sku = p.sku
+             WHERE d.order_id = %s
+        """, (order_id,)).fetchall()
 
-    claims = conn.execute("""
-        SELECT c.*,
-               w1.name AS physical_wh_name,
-               w2.name AS account_wh_name
-          FROM claims c
-          JOIN warehouses w1 ON c.physical_wh = w1.id
-          JOIN warehouses w2 ON c.account_wh  = w2.id
-         WHERE c.t_code = %s
-    """, (order_id,)).fetchall()
+        claims = conn.execute("""
+            SELECT c.*,
+                   w1.name AS physical_wh_name,
+                   w2.name AS account_wh_name
+              FROM claims c
+              JOIN warehouses w1 ON c.physical_wh = w1.id
+              JOIN warehouses w2 ON c.account_wh  = w2.id
+             WHERE c.t_code = %s
+        """, (order_id,)).fetchall()
 
-    conn.close()
     return {
         "order":   dict(order),
         "details": [dict(d) for d in details],
@@ -247,28 +227,25 @@ def create_transfer(body: TransferCreate):
     if not body.details:
         raise HTTPException(status_code=400, detail="至少填一個品項")
 
-    conn = db.get_conn()
-    for wh in (body.from_wh, body.to_wh):
-        if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (wh,)).fetchone():
-            conn.close()
-            raise HTTPException(status_code=400, detail=f"倉庫 {wh} 不存在")
+    with db.get_conn() as conn:
+        for wh in (body.from_wh, body.to_wh):
+            if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (wh,)).fetchone():
+                raise HTTPException(status_code=400, detail=f"倉庫 {wh} 不存在")
 
-    order_id = _new_id("TRF", "transfer_orders", "order_id")
-    now = datetime.now().isoformat()
-    conn.execute(
-        "INSERT INTO transfer_orders(order_id,from_wh,to_wh,status,ref_doc,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-        (order_id, body.from_wh, body.to_wh, "DRAFT", body.ref_doc, now, body.created_by)
-    )
-    for d in body.details:
-        if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (d.sku,)).fetchone():
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail=f"品項 {d.sku} 不存在")
+        order_id = _new_id("TRF")
+        now = datetime.now().isoformat()
         conn.execute(
-            "INSERT INTO transfer_order_details(order_id,sku,qty_ordered) VALUES (%s,%s,%s)",
-            (order_id, d.sku, d.qty_ordered)
+            "INSERT INTO transfer_orders(order_id,from_wh,to_wh,status,ref_doc,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (order_id, body.from_wh, body.to_wh, "DRAFT", body.ref_doc, now, body.created_by)
         )
-    conn.commit()
-    conn.close()
+        for d in body.details:
+            if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (d.sku,)).fetchone():
+                raise HTTPException(status_code=400, detail=f"品項 {d.sku} 不存在")
+            conn.execute(
+                "INSERT INTO transfer_order_details(order_id,sku,qty_ordered) VALUES (%s,%s,%s)",
+                (order_id, d.sku, d.qty_ordered)
+            )
+        conn.commit()
     return {"order_id": order_id, "status": "DRAFT"}
 
 
@@ -279,38 +256,34 @@ def issue_transfer(order_id: str, body: IssueRequest):
     狀態：DRAFT → IN_TRANSIT
     庫存：PICKING/BUFFER 扣除
     """
-    conn = db.get_conn()
-    order = conn.execute(
-        "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
-    ).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="調撥單不存在")
-    if order["status"] != "DRAFT":
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法執行出庫")
-
-    for item in body.details:
-        detail = conn.execute(
-            "SELECT * FROM transfer_order_details WHERE id=%s AND order_id=%s",
-            (item.detail_id, order_id)
+    with db.get_conn() as conn:
+        order = conn.execute(
+            "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
         ).fetchone()
-        if not detail:
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
+        if not order:
+            raise HTTPException(status_code=404, detail="調撥單不存在")
+        if order["status"] != "DRAFT":
+            raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法執行出庫")
+
+        for item in body.details:
+            detail = conn.execute(
+                "SELECT * FROM transfer_order_details WHERE id=%s AND order_id=%s",
+                (item.detail_id, order_id)
+            ).fetchone()
+            if not detail:
+                raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
+
+            conn.execute(
+                "UPDATE transfer_order_details SET qty_issued=%s WHERE id=%s",
+                (item.qty_issued, item.detail_id)
+            )
+            _deduct_inventory(conn, order["from_wh"], detail["sku"],
+                              item.qty_issued, order_id, body.created_by)
 
         conn.execute(
-            "UPDATE transfer_order_details SET qty_issued=%s WHERE id=%s",
-            (item.qty_issued, item.detail_id)
+            "UPDATE transfer_orders SET status='IN_TRANSIT' WHERE order_id=%s", (order_id,)
         )
-        _deduct_inventory(conn, order["from_wh"], detail["sku"],
-                          item.qty_issued, order_id, body.created_by)
-
-    conn.execute(
-        "UPDATE transfer_orders SET status='IN_TRANSIT' WHERE order_id=%s", (order_id,)
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
     return {"order_id": order_id, "status": "IN_TRANSIT"}
 
 
@@ -324,66 +297,62 @@ def receive_transfer(order_id: str, body: ReceiveRequest):
       shortage > 0 → 自動建 TRANSFER_SHORTAGE Claim（account_wh = 發貨倉）
       excess > 0   → 加入庫存，回傳提示請手動建 TRANSFER_EXCESS Claim
     """
-    conn = db.get_conn()
-    order = conn.execute(
-        "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
-    ).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="調撥單不存在")
-    if order["status"] != "IN_TRANSIT":
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法執行收貨")
-
-    auto_claims    = []
-    excess_notices = []
-
-    for item in body.details:
-        detail = conn.execute(
-            "SELECT * FROM transfer_order_details WHERE id=%s AND order_id=%s",
-            (item.detail_id, order_id)
+    with db.get_conn() as conn:
+        order = conn.execute(
+            "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
         ).fetchone()
-        if not detail:
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
+        if not order:
+            raise HTTPException(status_code=404, detail="調撥單不存在")
+        if order["status"] != "IN_TRANSIT":
+            raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法執行收貨")
 
-        issued   = detail["qty_issued"] or detail["qty_ordered"]
-        received = item.qty_received
-        shortage = max(0, issued - received)
-        excess   = max(0, received - issued)
+        auto_claims    = []
+        excess_notices = []
 
-        conn.execute("""
-            UPDATE transfer_order_details
-               SET qty_received=%s, shortage_qty=%s, excess_qty=%s
-             WHERE id=%s
-        """, (received, shortage, excess, item.detail_id))
+        for item in body.details:
+            detail = conn.execute(
+                "SELECT * FROM transfer_order_details WHERE id=%s AND order_id=%s",
+                (item.detail_id, order_id)
+            ).fetchone()
+            if not detail:
+                raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
 
-        mvt_id = _add_inventory(conn, order["to_wh"], detail["sku"],
-                                received, order_id, body.created_by)
+            issued   = detail["qty_issued"] or detail["qty_ordered"]
+            received = item.qty_received
+            shortage = max(0, issued - received)
+            excess   = max(0, received - issued)
 
-        if shortage > 0:
-            claim_id = _auto_shortage_claim(
-                conn, order_id,
-                order["from_wh"], order["to_wh"],
-                detail["sku"], shortage, mvt_id
-            )
-            auto_claims.append({
-                "sku": detail["sku"], "shortage": shortage,
-                "claim_id": claim_id,
-                "message": f"已自動建立 Claim，責任方：{order['from_wh']}"
-            })
+            conn.execute("""
+                UPDATE transfer_order_details
+                   SET qty_received=%s, shortage_qty=%s, excess_qty=%s
+                 WHERE id=%s
+            """, (received, shortage, excess, item.detail_id))
 
-        if excess > 0:
-            excess_notices.append({
-                "sku": detail["sku"], "excess": excess,
-                "message": "溢收，建議手動建立 TRANSFER_EXCESS Claim 通知發貨倉"
-            })
+            mvt_id = _add_inventory(conn, order["to_wh"], detail["sku"],
+                                    received, order_id, body.created_by)
 
-    conn.execute(
-        "UPDATE transfer_orders SET status='RECEIVED' WHERE order_id=%s", (order_id,)
-    )
-    conn.commit()
-    conn.close()
+            if shortage > 0:
+                claim_id = _auto_shortage_claim(
+                    conn, order_id,
+                    order["from_wh"], order["to_wh"],
+                    detail["sku"], shortage, mvt_id
+                )
+                auto_claims.append({
+                    "sku": detail["sku"], "shortage": shortage,
+                    "claim_id": claim_id,
+                    "message": f"已自動建立 Claim，責任方：{order['from_wh']}"
+                })
+
+            if excess > 0:
+                excess_notices.append({
+                    "sku": detail["sku"], "excess": excess,
+                    "message": "溢收，建議手動建立 TRANSFER_EXCESS Claim 通知發貨倉"
+                })
+
+        conn.execute(
+            "UPDATE transfer_orders SET status='RECEIVED' WHERE order_id=%s", (order_id,)
+        )
+        conn.commit()
 
     return {
         "order_id":      order_id,
@@ -399,31 +368,27 @@ def complete_transfer(order_id: str):
     RECEIVED → COMPLETED。
     有未結案的 Claim 會擋住結單。
     """
-    conn = db.get_conn()
-    order = conn.execute(
-        "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
-    ).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="調撥單不存在")
-    if order["status"] != "RECEIVED":
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法結單")
+    with db.get_conn() as conn:
+        order = conn.execute(
+            "SELECT * FROM transfer_orders WHERE order_id=%s", (order_id,)
+        ).fetchone()
+        if not order:
+            raise HTTPException(status_code=404, detail="調撥單不存在")
+        if order["status"] != "RECEIVED":
+            raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法結單")
 
-    open_n = conn.execute("""
-        SELECT COUNT(*) AS n FROM claims
-         WHERE t_code=%s AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')
-    """, (order_id,)).fetchone()["n"]
-    if open_n > 0:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail=f"尚有 {open_n} 筆未結案 Claim，請先處理再結單"
+        open_n = conn.execute("""
+            SELECT COUNT(*) AS n FROM claims
+             WHERE t_code=%s AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')
+        """, (order_id,)).fetchone()["n"]
+        if open_n > 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"尚有 {open_n} 筆未結案 Claim，請先處理再結單"
+            )
+
+        conn.execute(
+            "UPDATE transfer_orders SET status='COMPLETED' WHERE order_id=%s", (order_id,)
         )
-
-    conn.execute(
-        "UPDATE transfer_orders SET status='COMPLETED' WHERE order_id=%s", (order_id,)
-    )
-    conn.commit()
-    conn.close()
+        conn.commit()
     return {"order_id": order_id, "status": "COMPLETED"}

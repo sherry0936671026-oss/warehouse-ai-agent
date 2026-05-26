@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
+from uuid import uuid4
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import db
@@ -34,26 +35,13 @@ class ReceiveRequest(BaseModel):
 # ── ID Generators ─────────────────────────────────────────────────────────────
 
 def _new_inbound_id() -> str:
-    d = datetime.now().strftime("%Y%m%d")
-    conn = db.get_conn()
-    n = conn.execute(
-        "SELECT COUNT(*) AS n FROM inbound_orders WHERE order_id LIKE %s",
-        (f"INB-{d}-%",)
-    ).fetchone()["n"]
-    conn.close()
-    return f"INB-{d}-{n+1:03d}"
+    return f"INB-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 def _new_mvt_id() -> str:
     return f"MVT-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-def _new_claim_id(conn) -> str:
-    """同一個 conn 內計數，避免同 transaction 中序號衝突。"""
-    d = datetime.now().strftime("%Y%m%d")
-    n = conn.execute(
-        "SELECT COUNT(*) AS n FROM claims WHERE claim_id LIKE %s",
-        (f"CLM-{d}-%",)
-    ).fetchone()["n"]
-    return f"CLM-{d}-{n+1:03d}"
+def _new_claim_id() -> str:
+    return f"CLM-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 
 # ── Inventory Helpers ─────────────────────────────────────────────────────────
@@ -123,14 +111,7 @@ def _auto_claim(conn, t_code: str, claim_type: str,
                 shortage_qty: int, excess_qty: int,
                 responsible_party: str, trigger_mvt,
                 note: str) -> str:
-    """
-    建立內部問題帳 Claim（account_wh = physical_wh = 自己）。
-
-    claim_type 對應：
-      INBOUND_SHORTAGE  進貨短少，responsible_party = SUPPLIER
-      DAMAGE            到貨損壞，responsible_party = SUPPLIER（預設）
-    """
-    claim_id = _new_claim_id(conn)
+    claim_id = _new_claim_id()
     now = datetime.now().isoformat()
     conn.execute("""
         INSERT INTO claims
@@ -154,54 +135,51 @@ def _auto_claim(conn, t_code: str, claim_type: str,
 
 @router.get("")
 def list_inbound(warehouse_id: Optional[str] = None, status: Optional[str] = None):
-    conn = db.get_conn()
-    sql = """
-        SELECT o.*, w.name AS warehouse_name
-          FROM inbound_orders o
-          JOIN warehouses w ON o.warehouse_id = w.id
-         WHERE 1=1
-    """
-    params = []
-    if warehouse_id:
-        sql += " AND o.warehouse_id=%s"
-        params.append(warehouse_id)
-    if status:
-        sql += " AND o.status=%s"
-        params.append(status)
-    sql += " ORDER BY o.created_at DESC"
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        sql = """
+            SELECT o.*, w.name AS warehouse_name
+              FROM inbound_orders o
+              JOIN warehouses w ON o.warehouse_id = w.id
+             WHERE 1=1
+        """
+        params = []
+        if warehouse_id:
+            sql += " AND o.warehouse_id=%s"
+            params.append(warehouse_id)
+        if status:
+            sql += " AND o.status=%s"
+            params.append(status)
+        sql += " ORDER BY o.created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/{order_id}")
 def get_inbound(order_id: str):
-    conn = db.get_conn()
-    order = conn.execute("""
-        SELECT o.*, w.name AS warehouse_name
-          FROM inbound_orders o
-          JOIN warehouses w ON o.warehouse_id = w.id
-         WHERE o.order_id=%s
-    """, (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="入庫單不存在")
+    with db.get_conn() as conn:
+        order = conn.execute("""
+            SELECT o.*, w.name AS warehouse_name
+              FROM inbound_orders o
+              JOIN warehouses w ON o.warehouse_id = w.id
+             WHERE o.order_id=%s
+        """, (order_id,)).fetchone()
+        if not order:
+            raise HTTPException(status_code=404, detail="入庫單不存在")
 
-    details = conn.execute("""
-        SELECT d.*, p.name AS product_name, p.unit
-          FROM inbound_order_details d
-          JOIN products p ON d.sku = p.sku
-         WHERE d.order_id=%s
-    """, (order_id,)).fetchall()
+        details = conn.execute("""
+            SELECT d.*, p.name AS product_name, p.unit
+              FROM inbound_order_details d
+              JOIN products p ON d.sku = p.sku
+             WHERE d.order_id=%s
+        """, (order_id,)).fetchall()
 
-    claims = conn.execute("""
-        SELECT c.*, w.name AS warehouse_name
-          FROM claims c
-          JOIN warehouses w ON c.physical_wh = w.id
-         WHERE c.t_code=%s
-    """, (order_id,)).fetchall()
+        claims = conn.execute("""
+            SELECT c.*, w.name AS warehouse_name
+              FROM claims c
+              JOIN warehouses w ON c.physical_wh = w.id
+             WHERE c.t_code=%s
+        """, (order_id,)).fetchall()
 
-    conn.close()
     return {
         "order":   dict(order),
         "details": [dict(d) for d in details],
@@ -214,27 +192,24 @@ def create_inbound(body: InboundCreate):
     if not body.details:
         raise HTTPException(status_code=400, detail="至少填一個品項")
 
-    conn = db.get_conn()
-    if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (body.warehouse_id,)).fetchone():
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"倉庫 {body.warehouse_id} 不存在")
+    with db.get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (body.warehouse_id,)).fetchone():
+            raise HTTPException(status_code=400, detail=f"倉庫 {body.warehouse_id} 不存在")
 
-    order_id = _new_inbound_id()
-    now = datetime.now().isoformat()
-    conn.execute(
-        "INSERT INTO inbound_orders(order_id,warehouse_id,supplier,status,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s)",
-        (order_id, body.warehouse_id, body.supplier, "DRAFT", now, body.created_by)
-    )
-    for d in body.details:
-        if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (d.sku,)).fetchone():
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail=f"品項 {d.sku} 不存在")
+        order_id = _new_inbound_id()
+        now = datetime.now().isoformat()
         conn.execute(
-            "INSERT INTO inbound_order_details(order_id,sku,qty_expected) VALUES (%s,%s,%s)",
-            (order_id, d.sku, d.qty_expected)
+            "INSERT INTO inbound_orders(order_id,warehouse_id,supplier,status,created_at,created_by) VALUES (%s,%s,%s,%s,%s,%s)",
+            (order_id, body.warehouse_id, body.supplier, "DRAFT", now, body.created_by)
         )
-    conn.commit()
-    conn.close()
+        for d in body.details:
+            if not conn.execute("SELECT 1 FROM products WHERE sku=%s", (d.sku,)).fetchone():
+                raise HTTPException(status_code=400, detail=f"品項 {d.sku} 不存在")
+            conn.execute(
+                "INSERT INTO inbound_order_details(order_id,sku,qty_expected) VALUES (%s,%s,%s)",
+                (order_id, d.sku, d.qty_expected)
+            )
+        conn.commit()
     return {"order_id": order_id, "status": "DRAFT"}
 
 
@@ -250,96 +225,86 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
       短少（qty_expected - qty_actual > 0）→ 自動建 INBOUND_SHORTAGE Claim
       溢收（qty_actual > qty_expected）    → 正常入庫，紀錄在 excess_qty
     """
-    conn = db.get_conn()
-    order = conn.execute(
-        "SELECT * FROM inbound_orders WHERE order_id=%s", (order_id,)
-    ).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="入庫單不存在")
-    if order["status"] not in ("DRAFT", "RECEIVING"):
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法執行驗收")
-
-    auto_claims    = []
-    excess_notices = []
-
-    for item in body.details:
-        if item.damage_qty < 0 or item.qty_actual < 0:
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail="數量不能為負數")
-        if item.damage_qty > item.qty_actual:
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail="損壞數量不能超過實際到貨數量")
-
-        detail = conn.execute(
-            "SELECT * FROM inbound_order_details WHERE id=%s AND order_id=%s",
-            (item.detail_id, order_id)
+    with db.get_conn() as conn:
+        order = conn.execute(
+            "SELECT * FROM inbound_orders WHERE order_id=%s", (order_id,)
         ).fetchone()
-        if not detail:
-            conn.rollback(); conn.close()
-            raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
+        if not order:
+            raise HTTPException(status_code=404, detail="入庫單不存在")
+        if order["status"] not in ("DRAFT", "RECEIVING"):
+            raise HTTPException(status_code=400, detail=f"狀態 {order['status']} 無法執行驗收")
 
-        expected   = detail["qty_expected"]
-        actual     = item.qty_actual
-        damage     = item.damage_qty
-        good       = actual - damage
-        shortage   = max(0, expected - actual)
-        excess     = max(0, actual - expected)
+        auto_claims    = []
+        excess_notices = []
 
-        conn.execute("""
-            UPDATE inbound_order_details
-               SET qty_actual=%s, shortage_qty=%s, excess_qty=%s, damage_qty=%s
-             WHERE id=%s
-        """, (actual, shortage, excess, damage, item.detail_id))
+        for item in body.details:
+            if item.damage_qty < 0 or item.qty_actual < 0:
+                raise HTTPException(status_code=400, detail="數量不能為負數")
+            if item.damage_qty > item.qty_actual:
+                raise HTTPException(status_code=400, detail="損壞數量不能超過實際到貨數量")
 
-        # 良品入 BUFFER
-        if good > 0:
-            _put_to_buffer(conn, order["warehouse_id"], detail["sku"],
-                           good, order_id, body.created_by)
+            detail = conn.execute(
+                "SELECT * FROM inbound_order_details WHERE id=%s AND order_id=%s",
+                (item.detail_id, order_id)
+            ).fetchone()
+            if not detail:
+                raise HTTPException(status_code=400, detail=f"明細 id={item.detail_id} 不存在")
 
-        # 損壞品入 PROBLEM → 自動建 DAMAGE Claim
-        if damage > 0:
-            prob_mvt = _put_to_problem(conn, order["warehouse_id"], detail["sku"],
-                                        damage, order_id, body.created_by)
-            claim_id = _auto_claim(
-                conn, order_id, "DAMAGE",
-                order["warehouse_id"], detail["sku"],
-                damage, 0, "SUPPLIER", prob_mvt,
-                f"{order_id} {detail['sku']} 到貨損壞 {damage} 個，已移入問題品區"
-            )
-            auto_claims.append({
-                "sku": detail["sku"], "type": "DAMAGE",
-                "qty": damage, "claim_id": claim_id,
-                "message": f"損壞品已移入 PROBLEM 區，Claim 已建立"
-            })
+            expected   = detail["qty_expected"]
+            actual     = item.qty_actual
+            damage     = item.damage_qty
+            good       = actual - damage
+            shortage   = max(0, expected - actual)
+            excess     = max(0, actual - expected)
 
-        # 短少 → 自動建 INBOUND_SHORTAGE Claim
-        if shortage > 0:
-            claim_id = _auto_claim(
-                conn, order_id, "INBOUND_SHORTAGE",
-                order["warehouse_id"], detail["sku"],
-                shortage, 0, "SUPPLIER", None,
-                f"{order_id} {detail['sku']} 進貨短少 {shortage} 個，請聯繫供應商"
-            )
-            auto_claims.append({
-                "sku": detail["sku"], "type": "INBOUND_SHORTAGE",
-                "qty": shortage, "claim_id": claim_id,
-                "message": f"短少 {shortage} 個，已建立 Claim 責任方：SUPPLIER"
-            })
+            conn.execute("""
+                UPDATE inbound_order_details
+                   SET qty_actual=%s, shortage_qty=%s, excess_qty=%s, damage_qty=%s
+                 WHERE id=%s
+            """, (actual, shortage, excess, damage, item.detail_id))
 
-        # 溢收只記錄，不建 Claim
-        if excess > 0:
-            excess_notices.append({
-                "sku": detail["sku"], "excess": excess,
-                "message": f"溢收 {excess} 個，已入庫，請確認是否需要退回供應商"
-            })
+            if good > 0:
+                _put_to_buffer(conn, order["warehouse_id"], detail["sku"],
+                               good, order_id, body.created_by)
 
-    conn.execute(
-        "UPDATE inbound_orders SET status='COMPLETED' WHERE order_id=%s", (order_id,)
-    )
-    conn.commit()
-    conn.close()
+            if damage > 0:
+                prob_mvt = _put_to_problem(conn, order["warehouse_id"], detail["sku"],
+                                            damage, order_id, body.created_by)
+                claim_id = _auto_claim(
+                    conn, order_id, "DAMAGE",
+                    order["warehouse_id"], detail["sku"],
+                    damage, 0, "SUPPLIER", prob_mvt,
+                    f"{order_id} {detail['sku']} 到貨損壞 {damage} 個，已移入問題品區"
+                )
+                auto_claims.append({
+                    "sku": detail["sku"], "type": "DAMAGE",
+                    "qty": damage, "claim_id": claim_id,
+                    "message": f"損壞品已移入 PROBLEM 區，Claim 已建立"
+                })
+
+            if shortage > 0:
+                claim_id = _auto_claim(
+                    conn, order_id, "INBOUND_SHORTAGE",
+                    order["warehouse_id"], detail["sku"],
+                    shortage, 0, "SUPPLIER", None,
+                    f"{order_id} {detail['sku']} 進貨短少 {shortage} 個，請聯繫供應商"
+                )
+                auto_claims.append({
+                    "sku": detail["sku"], "type": "INBOUND_SHORTAGE",
+                    "qty": shortage, "claim_id": claim_id,
+                    "message": f"短少 {shortage} 個，已建立 Claim 責任方：SUPPLIER"
+                })
+
+            if excess > 0:
+                excess_notices.append({
+                    "sku": detail["sku"], "excess": excess,
+                    "message": f"溢收 {excess} 個，已入庫，請確認是否需要退回供應商"
+                })
+
+        conn.execute(
+            "UPDATE inbound_orders SET status='COMPLETED' WHERE order_id=%s", (order_id,)
+        )
+        conn.commit()
 
     return {
         "order_id":       order_id,
@@ -351,20 +316,17 @@ def receive_inbound(order_id: str, body: ReceiveRequest):
 
 @router.patch("/{order_id}/cancel")
 def cancel_inbound(order_id: str):
-    conn = db.get_conn()
-    order = conn.execute(
-        "SELECT status FROM inbound_orders WHERE order_id=%s", (order_id,)
-    ).fetchone()
-    if not order:
-        conn.close()
-        raise HTTPException(status_code=404, detail="入庫單不存在")
-    if order["status"] == "COMPLETED":
-        conn.close()
-        raise HTTPException(status_code=400, detail="已完成的入庫單無法取消")
+    with db.get_conn() as conn:
+        order = conn.execute(
+            "SELECT status FROM inbound_orders WHERE order_id=%s", (order_id,)
+        ).fetchone()
+        if not order:
+            raise HTTPException(status_code=404, detail="入庫單不存在")
+        if order["status"] == "COMPLETED":
+            raise HTTPException(status_code=400, detail="已完成的入庫單無法取消")
 
-    conn.execute(
-        "UPDATE inbound_orders SET status='CANCELLED' WHERE order_id=%s", (order_id,)
-    )
-    conn.commit()
-    conn.close()
+        conn.execute(
+            "UPDATE inbound_orders SET status='CANCELLED' WHERE order_id=%s", (order_id,)
+        )
+        conn.commit()
     return {"order_id": order_id, "status": "CANCELLED"}

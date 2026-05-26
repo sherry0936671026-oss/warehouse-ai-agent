@@ -4,27 +4,25 @@ from tools.claim_tools import list_claims, get_claim_summary
 
 
 def get_kpi(warehouse_id: str) -> dict:
-    conn = db.get_conn()
-    wh = conn.execute("SELECT * FROM warehouses WHERE id=%s", (warehouse_id,)).fetchone()
-    if not wh:
-        conn.close()
-        return {"error": f"找不到倉庫 {warehouse_id}"}
+    with db.get_conn() as conn:
+        wh = conn.execute("SELECT * FROM warehouses WHERE id=%s", (warehouse_id,)).fetchone()
+        if not wh:
+            return {"error": f"找不到倉庫 {warehouse_id}"}
 
-    total_claims = conn.execute(
-        "SELECT COUNT(*) AS n FROM claims WHERE physical_wh=%s OR account_wh=%s",
-        (warehouse_id, warehouse_id)
-    ).fetchone()["n"]
-    open_claims = conn.execute(
-        """SELECT COUNT(*) AS n FROM claims
-            WHERE (physical_wh=%s OR account_wh=%s)
-              AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')""",
-        (warehouse_id, warehouse_id)
-    ).fetchone()["n"]
-    completed_transfers = conn.execute(
-        "SELECT COUNT(*) AS n FROM transfer_orders WHERE (from_wh=%s OR to_wh=%s) AND status='COMPLETED'",
-        (warehouse_id, warehouse_id)
-    ).fetchone()["n"]
-    conn.close()
+        total_claims = conn.execute(
+            "SELECT COUNT(*) AS n FROM claims WHERE physical_wh=%s OR account_wh=%s",
+            (warehouse_id, warehouse_id)
+        ).fetchone()["n"]
+        open_claims = conn.execute(
+            """SELECT COUNT(*) AS n FROM claims
+                WHERE (physical_wh=%s OR account_wh=%s)
+                  AND status NOT IN ('RESOLVED','WRITTEN_OFF','REJECTED')""",
+            (warehouse_id, warehouse_id)
+        ).fetchone()["n"]
+        completed_transfers = conn.execute(
+            "SELECT COUNT(*) AS n FROM transfer_orders WHERE (from_wh=%s OR to_wh=%s) AND status='COMPLETED'",
+            (warehouse_id, warehouse_id)
+        ).fetchone()["n"]
 
     low_stock = check_safety_stock(warehouse_id)
     return {
@@ -41,18 +39,17 @@ def get_kpi(warehouse_id: str) -> dict:
 
 
 def get_anomalies() -> dict:
-    conn = db.get_conn()
-    in_transit = conn.execute("""
-        SELECT t.order_id, t.from_wh, wf.name AS from_name,
-               t.to_wh, wt.name AS to_name,
-               t.status, t.created_at
-          FROM transfer_orders t
-          JOIN warehouses wf ON t.from_wh = wf.id
-          JOIN warehouses wt ON t.to_wh   = wt.id
-         WHERE t.status NOT IN ('COMPLETED','CANCELLED')
-         ORDER BY t.created_at
-    """).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        in_transit = conn.execute("""
+            SELECT t.order_id, t.from_wh, wf.name AS from_name,
+                   t.to_wh, wt.name AS to_name,
+                   t.status, t.created_at
+              FROM transfer_orders t
+              JOIN warehouses wf ON t.from_wh = wf.id
+              JOIN warehouses wt ON t.to_wh   = wt.id
+             WHERE t.status NOT IN ('COMPLETED','CANCELLED')
+             ORDER BY t.created_at
+        """).fetchall()
 
     low_stock = check_safety_stock()
     open_claims = list_claims(status="PENDING") + list_claims(status="INVESTIGATING")

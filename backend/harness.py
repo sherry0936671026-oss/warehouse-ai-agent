@@ -2,8 +2,10 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
-VALID_CLAIM_STATUSES = {"待審查", "異議中", "已結案", "已拒絕"}
-VALID_WAREHOUSE_IDS = {"W1", "W2", "W3"}
+VALID_CLAIM_STATUSES = {
+    "PENDING", "INVESTIGATING", "IN_COLLECT_BUFFER",
+    "DISUSE_PENDING", "RESOLVED", "WRITTEN_OFF", "REJECTED",
+}
 
 
 class WarehouseHarness:
@@ -31,8 +33,6 @@ class WarehouseHarness:
         for wh in r.get("warehouses", []):
             if wh.get("quantity", -1) < 0:
                 return False, "庫存數量不可為負數"
-            if wh.get("warehouse_id") not in VALID_WAREHOUSE_IDS:
-                return False, f"未知倉庫 ID：{wh.get('warehouse_id')}"
         return True, "ok"
 
     def _val_compare(self, r):
@@ -50,10 +50,11 @@ class WarehouseHarness:
         return True, "ok"
 
     def _val_claim(self, r):
-        if r.get("status") and r["status"] not in VALID_CLAIM_STATUSES:
-            return False, f"非法 claim 狀態：{r['status']}"
-        if r.get("qty", 1) <= 0:
-            return False, "異議數量應 > 0"
+        status = r.get("status")
+        if status and status not in VALID_CLAIM_STATUSES:
+            return False, f"非法 claim 狀態：{status}"
+        if r.get("shortage_qty", 1) < 0 or r.get("excess_qty", 0) < 0:
+            return False, "異議數量不可為負數"
         return True, "ok"
 
     def _val_claims_list(self, r):

@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from uuid import uuid4
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import db
@@ -74,24 +75,14 @@ VALID_NEXT = {
 
 # ── ID Generators ─────────────────────────────────────────────────────────────
 
-def _new_claim_id(conn) -> str:
-    d = datetime.now().strftime("%Y%m%d")
-    n = conn.execute(
-        "SELECT COUNT(*) AS n FROM claims WHERE claim_id LIKE %s",
-        (f"CLM-{d}-%",)
-    ).fetchone()["n"]
-    return f"CLM-{d}-{n+1:03d}"
+def _new_claim_id() -> str:
+    return f"CLM-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 def _new_mvt_id() -> str:
     return f"MVT-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
-def _new_approval_id(conn) -> str:
-    d = datetime.now().strftime("%Y%m%d")
-    n = conn.execute(
-        "SELECT COUNT(*) AS n FROM approvals WHERE approval_id LIKE %s",
-        (f"APV-{d}-%",)
-    ).fetchone()["n"]
-    return f"APV-{d}-{n+1:03d}"
+def _new_approval_id() -> str:
+    return f"APV-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 
 # ── Zone Move Helpers ─────────────────────────────────────────────────────────
@@ -124,7 +115,6 @@ def _zone_move(conn, warehouse_id: str, sku: str,
     if not src_rows:
         return 0
 
-    # 找目標儲位
     dst_loc = conn.execute("""
         SELECT location_id FROM storage_locations
          WHERE warehouse_id=%s AND zone_type=%s
@@ -200,66 +190,62 @@ def list_claims(warehouse_id: Optional[str] = None,
     cross_warehouse=true  → 只顯示跨倉 Claim（TRANSFER_SHORTAGE / TRANSFER_EXCESS）
     cross_warehouse=false → 只顯示內部問題帳
     """
-    conn = db.get_conn()
-    sql = """
-        SELECT c.*,
-               wp.name AS physical_wh_name,
-               wa.name AS account_wh_name
-          FROM claims c
-          JOIN warehouses wp ON c.physical_wh = wp.id
-          JOIN warehouses wa ON c.account_wh  = wa.id
-         WHERE 1=1
-    """
-    params = []
-    if warehouse_id:
-        sql += " AND (c.physical_wh=%s OR c.account_wh=%s)"
-        params += [warehouse_id, warehouse_id]
-    if claim_type:
-        sql += " AND c.claim_type=%s"
-        params.append(claim_type)
-    if status:
-        sql += " AND c.status=%s"
-        params.append(status)
-    if cross_warehouse is True:
-        sql += " AND c.physical_wh != c.account_wh"
-    elif cross_warehouse is False:
-        sql += " AND c.physical_wh = c.account_wh"
-    sql += " ORDER BY c.created_at DESC"
+    with db.get_conn() as conn:
+        sql = """
+            SELECT c.*,
+                   wp.name AS physical_wh_name,
+                   wa.name AS account_wh_name
+              FROM claims c
+              JOIN warehouses wp ON c.physical_wh = wp.id
+              JOIN warehouses wa ON c.account_wh  = wa.id
+             WHERE 1=1
+        """
+        params = []
+        if warehouse_id:
+            sql += " AND (c.physical_wh=%s OR c.account_wh=%s)"
+            params += [warehouse_id, warehouse_id]
+        if claim_type:
+            sql += " AND c.claim_type=%s"
+            params.append(claim_type)
+        if status:
+            sql += " AND c.status=%s"
+            params.append(status)
+        if cross_warehouse is True:
+            sql += " AND c.physical_wh != c.account_wh"
+        elif cross_warehouse is False:
+            sql += " AND c.physical_wh = c.account_wh"
+        sql += " ORDER BY c.created_at DESC"
 
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/claims/{claim_id}")
 def get_claim(claim_id: str):
-    conn = db.get_conn()
-    claim = conn.execute("""
-        SELECT c.*,
-               wp.name AS physical_wh_name,
-               wa.name AS account_wh_name
-          FROM claims c
-          JOIN warehouses wp ON c.physical_wh = wp.id
-          JOIN warehouses wa ON c.account_wh  = wa.id
-         WHERE c.claim_id=%s
-    """, (claim_id,)).fetchone()
-    if not claim:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Claim 不存在")
+    with db.get_conn() as conn:
+        claim = conn.execute("""
+            SELECT c.*,
+                   wp.name AS physical_wh_name,
+                   wa.name AS account_wh_name
+              FROM claims c
+              JOIN warehouses wp ON c.physical_wh = wp.id
+              JOIN warehouses wa ON c.account_wh  = wa.id
+             WHERE c.claim_id=%s
+        """, (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(status_code=404, detail="Claim 不存在")
 
-    logs = conn.execute(
-        "SELECT * FROM claim_logs WHERE claim_id=%s ORDER BY timestamp",
-        (claim_id,)
-    ).fetchall()
+        logs = conn.execute(
+            "SELECT * FROM claim_logs WHERE claim_id=%s ORDER BY timestamp",
+            (claim_id,)
+        ).fetchall()
 
-    # 若有關聯的 inventory movement，一併帶出
-    movements = conn.execute("""
-        SELECT * FROM inventory_movements
-         WHERE t_code=%s OR movement_id=%s
-         ORDER BY created_at
-    """, (claim_id, claim["trigger_movement_id"] or "")).fetchall()
+        movements = conn.execute("""
+            SELECT * FROM inventory_movements
+             WHERE t_code=%s OR movement_id=%s
+             ORDER BY created_at
+        """, (claim_id, claim["trigger_movement_id"] or "")).fetchall()
 
-    conn.close()
     return {
         "claim":     dict(claim),
         "logs":      [dict(l) for l in logs],
@@ -275,29 +261,27 @@ def create_claim_manual(body: ManualClaimCreate):
         raise HTTPException(status_code=400,
             detail=f"手動建立只允許：{allowed}，其他類型由作業自動觸發")
 
-    conn = db.get_conn()
-    for wh in (body.physical_wh, body.account_wh, body.initiated_by):
-        if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (wh,)).fetchone():
-            conn.close()
-            raise HTTPException(status_code=400, detail=f"倉庫 {wh} 不存在")
+    with db.get_conn() as conn:
+        for wh in (body.physical_wh, body.account_wh, body.initiated_by):
+            if not conn.execute("SELECT 1 FROM warehouses WHERE id=%s", (wh,)).fetchone():
+                raise HTTPException(status_code=400, detail=f"倉庫 {wh} 不存在")
 
-    responsible = "ORIGIN_WH" if body.claim_type == "TRANSFER_SHORTAGE" else "DEST_WH"
-    claim_id = _new_claim_id(conn)
-    now = datetime.now().isoformat()
+        responsible = "ORIGIN_WH" if body.claim_type == "TRANSFER_SHORTAGE" else "DEST_WH"
+        claim_id = _new_claim_id()
+        now = datetime.now().isoformat()
 
-    conn.execute("""
-        INSERT INTO claims
-          (claim_id,t_code,trigger_movement_id,claim_type,
-           physical_wh,account_wh,initiated_by,responsible_party,
-           shortage_qty,excess_qty,status,created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (claim_id, body.t_code, None, body.claim_type,
-          body.physical_wh, body.account_wh, body.initiated_by, responsible,
-          body.shortage_qty, body.excess_qty, "PENDING", now))
-    _log(conn, claim_id, "手動建立", body.created_by, body.note)
+        conn.execute("""
+            INSERT INTO claims
+              (claim_id,t_code,trigger_movement_id,claim_type,
+               physical_wh,account_wh,initiated_by,responsible_party,
+               shortage_qty,excess_qty,status,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (claim_id, body.t_code, None, body.claim_type,
+              body.physical_wh, body.account_wh, body.initiated_by, responsible,
+              body.shortage_qty, body.excess_qty, "PENDING", now))
+        _log(conn, claim_id, "手動建立", body.created_by, body.note)
 
-    conn.commit()
-    conn.close()
+        conn.commit()
     return {"claim_id": claim_id, "status": "PENDING"}
 
 
@@ -306,16 +290,16 @@ def create_claim_manual(body: ManualClaimCreate):
 @router.post("/claims/{claim_id}/investigate")
 def investigate(claim_id: str, body: ActionRequest):
     """PENDING → INVESTIGATING"""
-    conn = db.get_conn()
-    claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
-    if not claim:
-        conn.close(); raise HTTPException(404, "Claim 不存在")
-    if "INVESTIGATING" not in VALID_NEXT.get(claim["status"], set()):
-        conn.close(); raise HTTPException(400, f"狀態 {claim['status']} 無法轉為 INVESTIGATING")
+    with db.get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(404, "Claim 不存在")
+        if "INVESTIGATING" not in VALID_NEXT.get(claim["status"], set()):
+            raise HTTPException(400, f"狀態 {claim['status']} 無法轉為 INVESTIGATING")
 
-    conn.execute("UPDATE claims SET status='INVESTIGATING' WHERE claim_id=%s", (claim_id,))
-    _log(conn, claim_id, "開始調查", body.actor, body.note)
-    conn.commit(); conn.close()
+        conn.execute("UPDATE claims SET status='INVESTIGATING' WHERE claim_id=%s", (claim_id,))
+        _log(conn, claim_id, "開始調查", body.actor, body.note)
+        conn.commit()
     return {"claim_id": claim_id, "status": "INVESTIGATING"}
 
 
@@ -330,46 +314,44 @@ def move_to_collect_buffer(claim_id: str, body: MoveToCollectBufferRequest):
     無實體物品的 Claim（短少類）：
       → 僅更新狀態，記錄 log（物品不存在，不做物理移動）
     """
-    conn = db.get_conn()
-    claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
-    if not claim:
-        conn.close(); raise HTTPException(404, "Claim 不存在")
-    if "IN_COLLECT_BUFFER" not in VALID_NEXT.get(claim["status"], set()):
-        conn.close(); raise HTTPException(400, f"狀態 {claim['status']} 無法移至集貨緩衝")
+    with db.get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(404, "Claim 不存在")
+        if "IN_COLLECT_BUFFER" not in VALID_NEXT.get(claim["status"], set()):
+            raise HTTPException(400, f"狀態 {claim['status']} 無法移至集貨緩衝")
 
-    cb_cat = body.cb_category or CLAIM_TYPE_TO_CB.get(claim["claim_type"], "SHORT")
+        cb_cat = body.cb_category or CLAIM_TYPE_TO_CB.get(claim["claim_type"], "SHORT")
 
-    # 驗證 cb_category 合法
-    valid_cats = {"SHORT", "QUALITY", "SPEC", "COUNT", "DAMAGE"}
-    if cb_cat not in valid_cats:
-        conn.close(); raise HTTPException(400, f"cb_category 必須是 {valid_cats} 之一")
+        valid_cats = {"SHORT", "QUALITY", "SPEC", "COUNT", "DAMAGE"}
+        if cb_cat not in valid_cats:
+            raise HTTPException(400, f"cb_category 必須是 {valid_cats} 之一")
 
-    moved_qty = 0
-    if claim["claim_type"] in PHYSICAL_CLAIM_TYPES:
-        # 找出關聯的 SKU（透過 trigger_movement_id）
-        sku = None
-        if claim["trigger_movement_id"]:
-            mvt = conn.execute(
-                "SELECT sku FROM inventory_movements WHERE movement_id=%s",
-                (claim["trigger_movement_id"],)
-            ).fetchone()
-            sku = mvt["sku"] if mvt else None
+        moved_qty = 0
+        if claim["claim_type"] in PHYSICAL_CLAIM_TYPES:
+            sku = None
+            if claim["trigger_movement_id"]:
+                mvt = conn.execute(
+                    "SELECT sku FROM inventory_movements WHERE movement_id=%s",
+                    (claim["trigger_movement_id"],)
+                ).fetchone()
+                sku = mvt["sku"] if mvt else None
 
-        if sku:
-            moved_qty = _zone_move(
-                conn, claim["physical_wh"], sku,
-                from_zone="PROBLEM", to_zone="COLLECT_BUFFER",
-                to_acct_status="FROZEN", t_code=claim_id,
-                actor=body.actor, to_cb_cat=cb_cat
-            )
+            if sku:
+                moved_qty = _zone_move(
+                    conn, claim["physical_wh"], sku,
+                    from_zone="PROBLEM", to_zone="COLLECT_BUFFER",
+                    to_acct_status="FROZEN", t_code=claim_id,
+                    actor=body.actor, to_cb_cat=cb_cat
+                )
 
-    conn.execute("UPDATE claims SET status='IN_COLLECT_BUFFER' WHERE claim_id=%s", (claim_id,))
-    note = body.note or (
-        f"物品已移入 CB-{cb_cat}（{moved_qty} 個）" if moved_qty
-        else f"邏輯移至 CB-{cb_cat}（無實體物品）"
-    )
-    _log(conn, claim_id, f"移入集貨緩衝 CB-{cb_cat}", body.actor, note)
-    conn.commit(); conn.close()
+        conn.execute("UPDATE claims SET status='IN_COLLECT_BUFFER' WHERE claim_id=%s", (claim_id,))
+        note = body.note or (
+            f"物品已移入 CB-{cb_cat}（{moved_qty} 個）" if moved_qty
+            else f"邏輯移至 CB-{cb_cat}（無實體物品）"
+        )
+        _log(conn, claim_id, f"移入集貨緩衝 CB-{cb_cat}", body.actor, note)
+        conn.commit()
     return {"claim_id": claim_id, "status": "IN_COLLECT_BUFFER",
             "cb_category": cb_cat, "moved_qty": moved_qty}
 
@@ -382,44 +364,43 @@ def move_to_disuse(claim_id: str, body: ActionRequest):
     有實體物品：COLLECT_BUFFER → DISUSE（PENDING_WRITEOFF）+ 建立審批單
     無實體物品：僅更新狀態 + 建立審批單
     """
-    conn = db.get_conn()
-    claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
-    if not claim:
-        conn.close(); raise HTTPException(404, "Claim 不存在")
-    if "DISUSE_PENDING" not in VALID_NEXT.get(claim["status"], set()):
-        conn.close(); raise HTTPException(400, f"狀態 {claim['status']} 無法移至廢棄品區")
+    with db.get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(404, "Claim 不存在")
+        if "DISUSE_PENDING" not in VALID_NEXT.get(claim["status"], set()):
+            raise HTTPException(400, f"狀態 {claim['status']} 無法移至廢棄品區")
 
-    moved_qty = 0
-    if claim["claim_type"] in PHYSICAL_CLAIM_TYPES:
-        sku = None
-        if claim["trigger_movement_id"]:
-            mvt = conn.execute(
-                "SELECT sku FROM inventory_movements WHERE movement_id=%s",
-                (claim["trigger_movement_id"],)
-            ).fetchone()
-            sku = mvt["sku"] if mvt else None
+        moved_qty = 0
+        if claim["claim_type"] in PHYSICAL_CLAIM_TYPES:
+            sku = None
+            if claim["trigger_movement_id"]:
+                mvt = conn.execute(
+                    "SELECT sku FROM inventory_movements WHERE movement_id=%s",
+                    (claim["trigger_movement_id"],)
+                ).fetchone()
+                sku = mvt["sku"] if mvt else None
 
-        if sku:
-            cb_cat = CLAIM_TYPE_TO_CB.get(claim["claim_type"], "SHORT")
-            moved_qty = _zone_move(
-                conn, claim["physical_wh"], sku,
-                from_zone="COLLECT_BUFFER", to_zone="DISUSE",
-                to_acct_status="PENDING_WRITEOFF", t_code=claim_id,
-                actor=body.actor, from_cb_cat=cb_cat
-            )
+            if sku:
+                cb_cat = CLAIM_TYPE_TO_CB.get(claim["claim_type"], "SHORT")
+                moved_qty = _zone_move(
+                    conn, claim["physical_wh"], sku,
+                    from_zone="COLLECT_BUFFER", to_zone="DISUSE",
+                    to_acct_status="PENDING_WRITEOFF", t_code=claim_id,
+                    actor=body.actor, from_cb_cat=cb_cat
+                )
 
-    # 建立審批單
-    apv_id = _new_approval_id(conn)
-    conn.execute("""
-        INSERT INTO approvals(approval_id,ref_type,ref_id,status,note,created_at)
-        VALUES (%s,%s,%s,%s,%s,%s)
-    """, (apv_id, "WRITEOFF", claim_id, "PENDING",
-          body.note or f"申請除帳 {moved_qty} 個", datetime.now().isoformat()))
+        apv_id = _new_approval_id()
+        conn.execute("""
+            INSERT INTO approvals(approval_id,ref_type,ref_id,status,note,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s)
+        """, (apv_id, "WRITEOFF", claim_id, "PENDING",
+              body.note or f"申請除帳 {moved_qty} 個", datetime.now().isoformat()))
 
-    conn.execute("UPDATE claims SET status='DISUSE_PENDING' WHERE claim_id=%s", (claim_id,))
-    _log(conn, claim_id, "申請除帳", body.actor,
-         f"移入廢棄品區 {moved_qty} 個，審批單：{apv_id}")
-    conn.commit(); conn.close()
+        conn.execute("UPDATE claims SET status='DISUSE_PENDING' WHERE claim_id=%s", (claim_id,))
+        _log(conn, claim_id, "申請除帳", body.actor,
+             f"移入廢棄品區 {moved_qty} 個，審批單：{apv_id}")
+        conn.commit()
     return {"claim_id": claim_id, "status": "DISUSE_PENDING", "approval_id": apv_id}
 
 
@@ -434,36 +415,36 @@ def resolve_claim(claim_id: str, body: ResolveRequest):
       RETURNED          物品退回
       ADJUSTED_INVENTORY 直接調整庫存（盤點差異）
     """
-    conn = db.get_conn()
-    claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
-    if not claim:
-        conn.close(); raise HTTPException(404, "Claim 不存在")
-    if "RESOLVED" not in VALID_NEXT.get(claim["status"], set()):
-        conn.close(); raise HTTPException(400, f"狀態 {claim['status']} 無法結案")
+    with db.get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(404, "Claim 不存在")
+        if "RESOLVED" not in VALID_NEXT.get(claim["status"], set()):
+            raise HTTPException(400, f"狀態 {claim['status']} 無法結案")
 
-    now = datetime.now().isoformat()
-    conn.execute(
-        "UPDATE claims SET status='RESOLVED', resolved_at=%s WHERE claim_id=%s",
-        (now, claim_id)
-    )
-    _log(conn, claim_id, f"結案（{body.resolution}）", body.actor, body.note)
-    conn.commit(); conn.close()
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE claims SET status='RESOLVED', resolved_at=%s WHERE claim_id=%s",
+            (now, claim_id)
+        )
+        _log(conn, claim_id, f"結案（{body.resolution}）", body.actor, body.note)
+        conn.commit()
     return {"claim_id": claim_id, "status": "RESOLVED", "resolution": body.resolution}
 
 
 @router.post("/claims/{claim_id}/reject")
 def reject_claim(claim_id: str, body: ActionRequest):
     """→ REJECTED"""
-    conn = db.get_conn()
-    claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
-    if not claim:
-        conn.close(); raise HTTPException(404, "Claim 不存在")
-    if "REJECTED" not in VALID_NEXT.get(claim["status"], set()):
-        conn.close(); raise HTTPException(400, f"狀態 {claim['status']} 無法拒絕")
+    with db.get_conn() as conn:
+        claim = conn.execute("SELECT * FROM claims WHERE claim_id=%s", (claim_id,)).fetchone()
+        if not claim:
+            raise HTTPException(404, "Claim 不存在")
+        if "REJECTED" not in VALID_NEXT.get(claim["status"], set()):
+            raise HTTPException(400, f"狀態 {claim['status']} 無法拒絕")
 
-    conn.execute("UPDATE claims SET status='REJECTED' WHERE claim_id=%s", (claim_id,))
-    _log(conn, claim_id, "拒絕", body.actor, body.note)
-    conn.commit(); conn.close()
+        conn.execute("UPDATE claims SET status='REJECTED' WHERE claim_id=%s", (claim_id,))
+        _log(conn, claim_id, "拒絕", body.actor, body.note)
+        conn.commit()
     return {"claim_id": claim_id, "status": "REJECTED"}
 
 
@@ -471,23 +452,22 @@ def reject_claim(claim_id: str, body: ActionRequest):
 
 @router.get("/approvals")
 def list_approvals(status: Optional[str] = None):
-    conn = db.get_conn()
-    sql = """
-        SELECT a.*,
-               c.claim_type, c.physical_wh, c.shortage_qty,
-               w.name AS warehouse_name
-          FROM approvals a
-          JOIN claims c ON a.ref_id = c.claim_id
-          JOIN warehouses w ON c.physical_wh = w.id
-         WHERE a.ref_type='WRITEOFF'
-    """
-    params = []
-    if status:
-        sql += " AND a.status=%s"
-        params.append(status)
-    sql += " ORDER BY a.created_at DESC"
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
+    with db.get_conn() as conn:
+        sql = """
+            SELECT a.*,
+                   c.claim_type, c.physical_wh, c.shortage_qty,
+                   w.name AS warehouse_name
+              FROM approvals a
+              JOIN claims c ON a.ref_id = c.claim_id
+              JOIN warehouses w ON c.physical_wh = w.id
+             WHERE a.ref_type='WRITEOFF'
+        """
+        params = []
+        if status:
+            sql += " AND a.status=%s"
+            params.append(status)
+        sql += " ORDER BY a.created_at DESC"
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -499,51 +479,50 @@ def approve_writeoff(approval_id: str, body: ApprovalActionRequest):
       2. DISUSE 區庫存正式歸零（WRITTEN_OFF）
       3. claims.status → WRITTEN_OFF
     """
-    conn = db.get_conn()
-    apv = conn.execute(
-        "SELECT * FROM approvals WHERE approval_id=%s", (approval_id,)
-    ).fetchone()
-    if not apv:
-        conn.close(); raise HTTPException(404, "審批單不存在")
-    if apv["status"] != "PENDING":
-        conn.close(); raise HTTPException(400, f"審批狀態 {apv['status']} 無法核准")
-
-    claim = conn.execute(
-        "SELECT * FROM claims WHERE claim_id=%s", (apv["ref_id"],)
-    ).fetchone()
-    if not claim:
-        conn.close(); raise HTTPException(404, "對應 Claim 不存在")
-
-    now = datetime.now().isoformat()
-
-    # 取得 SKU（透過 trigger_movement_id）
-    sku = None
-    if claim["trigger_movement_id"]:
-        mvt = conn.execute(
-            "SELECT sku FROM inventory_movements WHERE movement_id=%s",
-            (claim["trigger_movement_id"],)
+    with db.get_conn() as conn:
+        apv = conn.execute(
+            "SELECT * FROM approvals WHERE approval_id=%s", (approval_id,)
         ).fetchone()
-        sku = mvt["sku"] if mvt else None
+        if not apv:
+            raise HTTPException(404, "審批單不存在")
+        if apv["status"] != "PENDING":
+            raise HTTPException(400, f"審批狀態 {apv['status']} 無法核准")
 
-    written_off_qty = 0
-    if sku:
-        written_off_qty = _writeoff_inventory(
-            conn, claim["physical_wh"], sku, body.actor, apv["ref_id"]
+        claim = conn.execute(
+            "SELECT * FROM claims WHERE claim_id=%s", (apv["ref_id"],)
+        ).fetchone()
+        if not claim:
+            raise HTTPException(404, "對應 Claim 不存在")
+
+        now = datetime.now().isoformat()
+
+        sku = None
+        if claim["trigger_movement_id"]:
+            mvt = conn.execute(
+                "SELECT sku FROM inventory_movements WHERE movement_id=%s",
+                (claim["trigger_movement_id"],)
+            ).fetchone()
+            sku = mvt["sku"] if mvt else None
+
+        written_off_qty = 0
+        if sku:
+            written_off_qty = _writeoff_inventory(
+                conn, claim["physical_wh"], sku, body.actor, apv["ref_id"]
+            )
+
+        conn.execute("""
+            UPDATE approvals SET status='APPROVED', approved_by=%s, approved_at=%s, note=%s
+             WHERE approval_id=%s
+        """, (body.actor, now, body.note, approval_id))
+
+        conn.execute(
+            "UPDATE claims SET status='WRITTEN_OFF', resolved_at=%s WHERE claim_id=%s",
+            (now, apv["ref_id"])
         )
+        _log(conn, apv["ref_id"], "核准除帳", body.actor,
+             f"審批單 {approval_id} 核准，除帳 {written_off_qty} 個")
 
-    conn.execute("""
-        UPDATE approvals SET status='APPROVED', approved_by=%s, approved_at=%s, note=%s
-         WHERE approval_id=%s
-    """, (body.actor, now, body.note, approval_id))
-
-    conn.execute(
-        "UPDATE claims SET status='WRITTEN_OFF', resolved_at=%s WHERE claim_id=%s",
-        (now, apv["ref_id"])
-    )
-    _log(conn, apv["ref_id"], "核准除帳", body.actor,
-         f"審批單 {approval_id} 核准，除帳 {written_off_qty} 個")
-
-    conn.commit(); conn.close()
+        conn.commit()
     return {
         "approval_id":    approval_id,
         "claim_id":       apv["ref_id"],
@@ -559,27 +538,27 @@ def reject_approval(approval_id: str, body: ApprovalActionRequest):
       1. approvals.status → REJECTED
       2. claims.status → IN_COLLECT_BUFFER（退回等待重新判定）
     """
-    conn = db.get_conn()
-    apv = conn.execute(
-        "SELECT * FROM approvals WHERE approval_id=%s", (approval_id,)
-    ).fetchone()
-    if not apv:
-        conn.close(); raise HTTPException(404, "審批單不存在")
-    if apv["status"] != "PENDING":
-        conn.close(); raise HTTPException(400, f"審批狀態 {apv['status']} 無法拒絕")
+    with db.get_conn() as conn:
+        apv = conn.execute(
+            "SELECT * FROM approvals WHERE approval_id=%s", (approval_id,)
+        ).fetchone()
+        if not apv:
+            raise HTTPException(404, "審批單不存在")
+        if apv["status"] != "PENDING":
+            raise HTTPException(400, f"審批狀態 {apv['status']} 無法拒絕")
 
-    now = datetime.now().isoformat()
-    conn.execute("""
-        UPDATE approvals SET status='REJECTED', approved_by=%s, approved_at=%s, note=%s
-         WHERE approval_id=%s
-    """, (body.actor, now, body.note, approval_id))
-    conn.execute(
-        "UPDATE claims SET status='IN_COLLECT_BUFFER' WHERE claim_id=%s",
-        (apv["ref_id"],)
-    )
-    _log(conn, apv["ref_id"], "除帳申請被拒", body.actor,
-         f"審批單 {approval_id} 拒絕，退回集貨緩衝區重新判定")
+        now = datetime.now().isoformat()
+        conn.execute("""
+            UPDATE approvals SET status='REJECTED', approved_by=%s, approved_at=%s, note=%s
+             WHERE approval_id=%s
+        """, (body.actor, now, body.note, approval_id))
+        conn.execute(
+            "UPDATE claims SET status='IN_COLLECT_BUFFER' WHERE claim_id=%s",
+            (apv["ref_id"],)
+        )
+        _log(conn, apv["ref_id"], "除帳申請被拒", body.actor,
+             f"審批單 {approval_id} 拒絕，退回集貨緩衝區重新判定")
 
-    conn.commit(); conn.close()
+        conn.commit()
     return {"approval_id": approval_id, "status": "REJECTED",
             "claim_status": "IN_COLLECT_BUFFER"}

@@ -92,16 +92,14 @@ class WarehouseHarness:
 ```
 Frontend           Backend              AI
 React (Vite)  ──▶  FastAPI         ──▶  Claude claude-sonnet-4-6
-axios              SQLite (2個)          Multi-Agent + Tool Use
-                   ├── warehouse_agent.db   (AI agent 資料)
-                   └── warehouse_claim.db   (Claim CRUD)
+axios              PostgreSQL            Multi-Agent + Tool Use
 ```
 
 | 層 | 技術 |
 |----|------|
 | 前端 | React 19, Vite, axios |
-| 後端 | FastAPI, SQLModel, SQLite |
-| AI | Anthropic Claude claude-sonnet-4-6, Groq llama-3.3-70b |
+| 後端 | FastAPI, psycopg2, PostgreSQL |
+| AI | Anthropic Claude claude-sonnet-4-6 |
 | 部署 | Railway（後端）, Netlify（前端）|
 
 ---
@@ -118,10 +116,8 @@ cd backend
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env            # 填入 ANTHROPIC_API_KEY 和 GROQ_API_KEY
-python3 seed.py                 # 建立 Claim 假資料
-uvicorn main:app --reload       # 啟動於 http://localhost:8000
-# AI agent 資料會在首次啟動時自動建立
+cp .env.example .env            # 填入 ANTHROPIC_API_KEY 和 DATABASE_URL
+uvicorn main:app --reload       # 啟動於 http://localhost:8000（首次啟動自動建表並 seed）
 
 # 3. Frontend（另開終端機）
 cd frontend
